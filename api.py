@@ -277,42 +277,49 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
         # connects the solid price line seamlessly to the dashed forecast line
         chart_data[-1]["predictedPrice"] = chart_data[-1]["price"]
 
-        # Loop 2: Forecast — { date, price: null, predictedPrice: base_case }
+        # --- Forecast: try ML model, fall back to linear-trend simulation ---
+        models = _load_models()
+        is_simulated = models is None
+
+        if not is_simulated:
+            try:
+                ranges = _get_range_forecasts(hist, "Close", models)
+                if ranges and "1D" in ranges:
+                    low_1d, high_1d = ranges["1D"]
+                    trend_per_day = ((low_1d + high_1d) / 2) - current_price
+                else:
+                    raise ValueError("Model could not produce range forecasts")
+            except Exception as exc:
+                print(f"[Forecast] Model prediction failed, falling back to simulation: {exc}")
+                is_simulated = True
+
+        if is_simulated:
+            # Simulated AI Forecast: linear trend extrapolated from last 5 closes
+            n_recent = min(5, len(close))
+            recent = [float(close.iloc[-(n_recent - j)]) for j in range(n_recent)]
+            trend_per_day = (recent[-1] - recent[0]) / max(n_recent - 1, 1)
+
         last_ts = hist.index[-1]
-        last_bull = current_price
-        last_base = current_price
-        last_bear = current_price
-        if is_intraday:
-            n_forecast = 10
-            for i in range(1, n_forecast + 1):
+        n_forecast = 10 if is_intraday else 30
+        for i in range(1, n_forecast + 1):
+            if is_intraday:
                 next_ts = last_ts + datetime.timedelta(minutes=5 * i)
                 future_date_str = next_ts.strftime(date_fmt) if hasattr(next_ts, "strftime") else str(next_ts)[:5]
-                mult = 0.0005 * i
-                last_bull = current_price * (1 + mult)
-                last_base = current_price * (1 + mult * 0.5)
-                last_bear = current_price * (1 - mult)
-                chart_data.append({
-                    "date": future_date_str,
-                    "price": None,
-                    "predictedPrice": round(last_base, 2),
-                })
-        else:
-            for i in range(1, 31):
+            else:
                 future_date = last_ts + datetime.timedelta(days=i)
                 future_date_str = future_date.strftime(date_fmt) if hasattr(future_date, "strftime") else str(future_date)[:10]
-                last_bull = current_price * (1 + 0.005 * i)
-                last_base = current_price * (1 + 0.001 * i)
-                last_bear = current_price * (1 - 0.004 * i)
-                chart_data.append({
-                    "date": future_date_str,
-                    "price": None,
-                    "predictedPrice": round(last_base, 2),
-                })
+            predicted = current_price + trend_per_day * i
+            chart_data.append({
+                "date": future_date_str,
+                "price": None,
+                "predictedPrice": round(predicted, 2),
+            })
 
+        last_predicted = current_price + trend_per_day * n_forecast
         forecast_summary = {
-            "bull": round(last_bull, 2),
-            "base": round(last_base, 2),
-            "bear": round(last_bear, 2),
+            "bull": round(last_predicted * 1.02, 2),
+            "base": round(last_predicted, 2),
+            "bear": round(last_predicted * 0.98, 2),
         }
 
         return {
@@ -321,6 +328,7 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
             "change_pct": round(change_pct, 2),
             "chart_data": chart_data,
             "forecast_summary": forecast_summary,
+            "is_simulated": is_simulated,
         }
     except HTTPException:
         raise
