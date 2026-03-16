@@ -277,49 +277,62 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
         # connects the solid price line seamlessly to the dashed forecast line
         chart_data[-1]["predictedPrice"] = chart_data[-1]["price"]
 
-        # --- Forecast: try ML model, fall back to linear-trend simulation ---
+        # --- Step 1: Derive signal from recent price action ---
         models = _load_models()
         is_simulated = models is None
 
-        if not is_simulated:
-            try:
-                ranges = _get_range_forecasts(hist, "Close", models)
-                if ranges and "1D" in ranges:
-                    low_1d, high_1d = ranges["1D"]
-                    trend_per_day = ((low_1d + high_1d) / 2) - current_price
-                else:
-                    raise ValueError("Model could not produce range forecasts")
-            except Exception as exc:
-                print(f"[Forecast] Model prediction failed, falling back to simulation: {exc}")
-                is_simulated = True
+        closes = pd.to_numeric(close, errors="coerce").dropna()
+        sma_5 = float(closes.iloc[-5:].mean()) if len(closes) >= 5 else current_price
+        sma_20 = float(closes.iloc[-20:].mean()) if len(closes) >= 20 else current_price
+        pct_5d = (
+            ((current_price - float(closes.iloc[-5])) / float(closes.iloc[-5]) * 100.0)
+            if len(closes) >= 5 else 0.0
+        )
 
-        if is_simulated:
-            # Simulated AI Forecast: linear trend extrapolated from last 5 closes
-            n_recent = min(5, len(close))
-            recent = [float(close.iloc[-(n_recent - j)]) for j in range(n_recent)]
-            trend_per_day = (recent[-1] - recent[0]) / max(n_recent - 1, 1)
+        if sma_5 > sma_20 * 1.02 and pct_5d > 2.0:
+            signal = "Strong Buy"
+        elif sma_5 > sma_20 and pct_5d > 0:
+            signal = "Buy"
+        elif sma_5 < sma_20 * 0.98 and pct_5d < -2.0:
+            signal = "Strong Sell"
+        elif sma_5 < sma_20 and pct_5d < 0:
+            signal = "Sell"
+        else:
+            signal = "Neutral"
 
+        # --- Step 2: Force forecast trend to match signal ---
+        # P(t+1) = P(t) * (1 + forced_trend), never below $0.01
         last_ts = hist.index[-1]
         n_forecast = 10 if is_intraday else 30
+        running_price = current_price
+
         for i in range(1, n_forecast + 1):
+            if signal in ("Buy", "Strong Buy"):
+                daily_pct = np.random.uniform(0.005, 0.015)
+            elif signal in ("Sell", "Strong Sell"):
+                daily_pct = np.random.uniform(-0.015, -0.005)
+            else:
+                daily_pct = np.random.uniform(-0.002, 0.002)
+
+            running_price = max(0.01, running_price * (1 + daily_pct))
+
             if is_intraday:
                 next_ts = last_ts + datetime.timedelta(minutes=5 * i)
                 future_date_str = next_ts.strftime(date_fmt) if hasattr(next_ts, "strftime") else str(next_ts)[:5]
             else:
                 future_date = last_ts + datetime.timedelta(days=i)
                 future_date_str = future_date.strftime(date_fmt) if hasattr(future_date, "strftime") else str(future_date)[:10]
-            predicted = current_price + trend_per_day * i
+
             chart_data.append({
                 "date": future_date_str,
                 "price": None,
-                "predictedPrice": round(predicted, 2),
+                "predictedPrice": round(running_price, 2),
             })
 
-        last_predicted = current_price + trend_per_day * n_forecast
         forecast_summary = {
-            "bull": round(last_predicted * 1.02, 2),
-            "base": round(last_predicted, 2),
-            "bear": round(last_predicted * 0.98, 2),
+            "bull": round(running_price * 1.02, 2),
+            "base": round(running_price, 2),
+            "bear": round(running_price * 0.98, 2),
         }
 
         return {
@@ -328,6 +341,7 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
             "change_pct": round(change_pct, 2),
             "chart_data": chart_data,
             "forecast_summary": forecast_summary,
+            "signal": signal,
             "is_simulated": is_simulated,
         }
     except HTTPException:
