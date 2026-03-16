@@ -16,7 +16,7 @@ from plotly.subplots import make_subplots
 from config import ASSET_MAP
 
 
-API_BASE_URL = "http://localhost:8000"
+API_BASE_URL = "https://globalmarketpredictor.onrender.com"
 RAW_PRICES_DIR = Path("data") / "raw_prices"
 RAW_NEWS_DIR = Path("data") / "raw_news"
 NEWS_LOOKBACK_DAYS = 7

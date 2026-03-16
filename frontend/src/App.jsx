@@ -873,7 +873,7 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
       setIsChartSyncing(true);
       try {
         // ✏️ FastAPI backend URL — change host/port here if your server runs elsewhere
-        const url = `http://127.0.0.1:8000/api/analyze?ticker=${encodeURIComponent(stock.ticker)}&time_range=3mo`;
+        const url = `https://globalmarketpredictor.onrender.com/api/analyze?ticker=${encodeURIComponent(stock.ticker)}&time_range=3mo`;
         const res = await fetch(url);
         if (!res.ok) throw new Error(`API returned ${res.status} ${res.statusText}`);
         const json = await res.json();
