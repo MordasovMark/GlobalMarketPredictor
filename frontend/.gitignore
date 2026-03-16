@@ -1,0 +1,8 @@
+# Ignore React libraries
+frontend/node_modules/
+node_modules/
+
+# Ignore files over 100MB (GitHub limit)
+ai_trading_model.pkl
+# Ignore temporary folders
+_bmad/
