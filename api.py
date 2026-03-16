@@ -277,7 +277,7 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
         # connects the solid price line seamlessly to the dashed forecast line
         chart_data[-1]["predictedPrice"] = chart_data[-1]["price"]
 
-        # --- Step 1: Derive signal from recent price action ---
+        # --- Step 1: Derive signal from recent price action (SMA-5 vs SMA-20) ---
         models = _load_models()
         is_simulated = models is None
 
@@ -289,32 +289,32 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
             if len(closes) >= 5 else 0.0
         )
 
-        if sma_5 > sma_20 * 1.02 and pct_5d > 2.0:
-            signal = "Strong Buy"
-        elif sma_5 > sma_20 and pct_5d > 0:
-            signal = "Buy"
-        elif sma_5 < sma_20 * 0.98 and pct_5d < -2.0:
-            signal = "Strong Sell"
+        if sma_5 > sma_20 and pct_5d > 0:
+            signal = "BUY"
         elif sma_5 < sma_20 and pct_5d < 0:
-            signal = "Sell"
+            signal = "SELL"
         else:
-            signal = "Neutral"
+            signal = "HOLD"
 
-        # --- Step 2: Force forecast trend to match signal ---
-        # P(t+1) = P(t) * (1 + forced_trend), never below $0.01
+        # --- Step 2: Build a 7-day forecast consistent with the signal ---
+        n_forecast = 7
+
+        if signal == "BUY":
+            total_pct = np.random.uniform(0.01, 0.065)      # +1% to +6.5% total
+        elif signal == "SELL":
+            total_pct = np.random.uniform(-0.05, -0.02)     # -2% to -5% total
+        else:
+            total_pct = np.random.uniform(-0.01, 0.002)     # -1% to +0.2% total
+
+        # Distribute the total move evenly: daily_rate = (1 + total)^(1/n) - 1
+        base_daily = (1.0 + total_pct) ** (1.0 / n_forecast) - 1.0
+
         last_ts = hist.index[-1]
-        n_forecast = 10 if is_intraday else 30
         running_price = current_price
 
         for i in range(1, n_forecast + 1):
-            if signal in ("Buy", "Strong Buy"):
-                daily_pct = np.random.uniform(0.005, 0.015)
-            elif signal in ("Sell", "Strong Sell"):
-                daily_pct = np.random.uniform(-0.015, -0.005)
-            else:
-                daily_pct = np.random.uniform(-0.002, 0.002)
-
-            running_price = max(0.01, running_price * (1 + daily_pct))
+            jitter = np.random.uniform(-0.0005, 0.0005)     # ±0.05% noise
+            running_price = max(0.01, running_price * (1.0 + base_daily + jitter))
 
             if is_intraday:
                 next_ts = last_ts + datetime.timedelta(minutes=5 * i)
