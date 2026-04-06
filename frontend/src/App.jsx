@@ -1,8 +1,8 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 // framer-motion REMOVED — it was loading a duplicate React instance from a
 // parent node_modules tree, causing "Invalid hook call" and a blank screen.
 // All animations replaced with CSS transitions.
-import { Search, ArrowLeft, TrendingUp, TrendingDown, CheckCircle, AlertTriangle, Minus, Info } from 'lucide-react';
+import { Search, ArrowLeft, TrendingUp, TrendingDown, CheckCircle, AlertTriangle, Minus, Info, Star, X, Briefcase } from 'lucide-react';
 import {
   ComposedChart,
   AreaChart,
@@ -50,7 +50,41 @@ const CARD_BASE = 'bg-[#12131a] border border-slate-800/80 rounded-xl';
 // Finnhub API key with hard-coded fallback so missing env does not break live data.
 const FINNHUB_API_TOKEN = (import.meta.env?.VITE_FINNHUB_KEY || 'd6r89m1r01qgdhqdj95gd6r89m1r01qgdhqdj960')?.trim?.();
 const FEAR_GREED_API_URL = 'http://127.0.0.1:5000/api/fear-greed';
+
+/** FastAPI backend base URL: local dev vs production (Render). Uses hostname so prod builds never default to localhost. */
+function resolveApiBaseUrl() {
+  if (typeof window === 'undefined') {
+    return 'https://globalmarketpredictor.onrender.com';
+  }
+  const host = window.location.hostname;
+  if (host === 'localhost' || host === '127.0.0.1') {
+    return 'http://localhost:8000';
+  }
+  return 'https://globalmarketpredictor.onrender.com';
+}
+const API_BASE_URL = resolveApiBaseUrl().replace(/\/$/, '');
 const LIVE_POLL_MS = 60 * 1000;
+const WATCHLIST_STORAGE_KEY = 'globalMarketPredictor_watchlist_v1';
+const WATCHLIST_MAX = 30;
+
+function loadWatchlistTickers() {
+  try {
+    const raw = localStorage.getItem(WATCHLIST_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return [...new Set(parsed.map((t) => String(t || '').trim().toUpperCase()).filter(Boolean))].slice(0, WATCHLIST_MAX);
+  } catch {
+    return [];
+  }
+}
+
+function saveWatchlistTickers(tickers) {
+  try {
+    localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(tickers));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
 const FINNHUB_QUOTE_URL = (ticker) =>
   `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_API_TOKEN}`;
 const FINNHUB_CANDLE_URL = (ticker, from, to) =>
@@ -160,6 +194,284 @@ const TOP_US_STOCKS = [
   { ticker: 'COST',  name: 'Costco Wholesale',      price: 845.90, changePercent:  0.91, high52: 890.00, low52: 680.00, avgVolume:  2_100_000, pe: 52.3, dividendYield: 0.60, domain: 'costco.com',            marketCap:  375 },
   { ticker: 'HD',    name: 'Home Depot',            price: 385.20, changePercent: -0.41, high52: 420.00, low52: 315.00, avgVolume:  4_200_000, pe: 23.8, dividendYield: 2.30, domain: 'homedepot.com',         marketCap:  380 },
 ];
+
+function getStockMeta(ticker) {
+  const u = String(ticker || '').toUpperCase();
+  return TOP_US_STOCKS.find((s) => s.ticker?.toUpperCase() === u);
+}
+
+/** Demo portfolio: fixed positions for UI only (tickers must exist in TOP_US_STOCKS). */
+const DEMO_PORTFOLIO_HOLDINGS = [
+  { ticker: 'AAPL', shares: 12, avgCost: 198.5 },
+  { ticker: 'MSFT', shares: 8, avgCost: 402.0 },
+  { ticker: 'NVDA', shares: 15, avgCost: 95.25 },
+  { ticker: 'GOOGL', shares: 10, avgCost: 158.0 },
+  { ticker: 'AMZN', shares: 14, avgCost: 185.0 },
+  { ticker: 'META', shares: 6, avgCost: 485.0 },
+];
+
+/** Builds demo portfolio rows with live prices plus AI signal from STOCK_AI_RATINGS (same engine as stock detail). */
+function buildDemoPortfolioRows(liveQuotes) {
+  return DEMO_PORTFOLIO_HOLDINGS.map((h) => {
+    const meta = getStockMeta(h.ticker);
+    const q = liveQuotes[h.ticker];
+    const price = Number(q?.price ?? meta?.price ?? 0);
+    const shares = Number(h.shares);
+    const avgCost = Number(h.avgCost);
+    const costBasis = shares * avgCost;
+    const marketValue = shares * price;
+    const pl = marketValue - costBasis;
+    const plPct = costBasis > 0 ? (pl / costBasis) * 100 : 0;
+    const rating = STOCK_AI_RATINGS[h.ticker];
+    const aiScore = rating?.score ?? 0;
+    const signal = getSignal(aiScore);
+    return {
+      ticker: h.ticker,
+      shares,
+      avgCost,
+      name: meta?.name ?? h.ticker,
+      price,
+      costBasis,
+      marketValue,
+      pl,
+      plPct,
+      aiScore,
+      signal,
+      aiSummary: rating?.summary ?? '',
+    };
+  });
+}
+
+function sumDemoPortfolioTotals(rows) {
+  const costBasis = rows.reduce((s, r) => s + r.costBasis, 0);
+  const marketValue = rows.reduce((s, r) => s + r.marketValue, 0);
+  const pl = marketValue - costBasis;
+  const plPct = costBasis > 0 ? (pl / costBasis) * 100 : 0;
+  return { costBasis, marketValue, pl, plPct };
+}
+
+/** Mock algo performance — replace when API provides analytics. */
+const SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK = {
+  totalTradesExecuted: 47,
+  winRatePct: 63.8,
+  bestTrade: { ticker: 'NVDA', label: '+$3,180', sub: '+14.6% round-trip' },
+  worstTrade: { ticker: 'META', label: '−$624', sub: '−2.1% round-trip' },
+};
+
+/** Mock recent executions — replace when API supplies model trade log. */
+const SIGNAL_DEMO_RECENT_MODEL_ACTIONS_MOCK = [
+  { date: '2026-04-04', ticker: 'NVDA', action: 'BUY', shares: 18, executionPrice: 118.4 },
+  { date: '2026-04-03', ticker: 'MSFT', action: 'SELL', shares: 4, executionPrice: 416.25 },
+  { date: '2026-04-02', ticker: 'AAPL', action: 'BUY', shares: 25, executionPrice: 226.1 },
+  { date: '2026-04-01', ticker: 'GOOGL', action: 'BUY', shares: 22, executionPrice: 171.88 },
+  { date: '2026-03-31', ticker: 'AMZN', action: 'SELL', shares: 9, executionPrice: 199.5 },
+  { date: '2026-03-28', ticker: 'META', action: 'BUY', shares: 5, executionPrice: 512.4 },
+  { date: '2026-03-27', ticker: 'NVDA', action: 'SELL', shares: 12, executionPrice: 115.05 },
+  { date: '2026-03-26', ticker: 'AAPL', action: 'SELL', shares: 10, executionPrice: 223.9 },
+];
+
+/**
+ * Full paper-trade log for performance drill-down modal.
+ * `pl` = realized P/L on SELL legs (null on BUY / opens).
+ * `isWin` = true when pl > 0 on a closing leg (for win-rate drill-down).
+ */
+const SIGNAL_DEMO_TRADE_HISTORY_FULL_MOCK = [
+  { date: '2026-04-04', ticker: 'NVDA', action: 'BUY', shares: 18, executionPrice: 118.4, pl: null, isWin: null },
+  { date: '2026-04-03', ticker: 'MSFT', action: 'SELL', shares: 4, executionPrice: 416.25, pl: 412.5, isWin: true },
+  { date: '2026-04-02', ticker: 'AAPL', action: 'BUY', shares: 25, executionPrice: 226.1, pl: null, isWin: null },
+  { date: '2026-04-01', ticker: 'GOOGL', action: 'BUY', shares: 22, executionPrice: 171.88, pl: null, isWin: null },
+  { date: '2026-03-31', ticker: 'AMZN', action: 'SELL', shares: 9, executionPrice: 199.5, pl: -88.2, isWin: false },
+  { date: '2026-03-30', ticker: 'NVDA', action: 'BUY', shares: 30, executionPrice: 116.2, pl: null, isWin: null },
+  { date: '2026-03-29', ticker: 'GOOGL', action: 'SELL', shares: 15, executionPrice: 173.4, pl: 521.4, isWin: true },
+  { date: '2026-03-28', ticker: 'META', action: 'BUY', shares: 5, executionPrice: 512.4, pl: null, isWin: null },
+  { date: '2026-03-27', ticker: 'NVDA', action: 'SELL', shares: 12, executionPrice: 115.05, pl: 1842.6, isWin: true },
+  { date: '2026-03-26', ticker: 'AAPL', action: 'SELL', shares: 10, executionPrice: 223.9, pl: 156.0, isWin: true },
+  { date: '2026-03-25', ticker: 'MSFT', action: 'BUY', shares: 10, executionPrice: 409.8, pl: null, isWin: null },
+  { date: '2026-03-24', ticker: 'META', action: 'SELL', shares: 4, executionPrice: 508.1, pl: -624.0, isWin: false },
+  { date: '2026-03-23', ticker: 'AMZN', action: 'BUY', shares: 20, executionPrice: 192.4, pl: null, isWin: null },
+  { date: '2026-03-22', ticker: 'NVDA', action: 'SELL', shares: 20, executionPrice: 112.8, pl: 3180.0, isWin: true },
+  { date: '2026-03-21', ticker: 'AAPL', action: 'BUY', shares: 15, executionPrice: 221.5, pl: null, isWin: null },
+  { date: '2026-03-20', ticker: 'GOOGL', action: 'BUY', shares: 12, executionPrice: 169.2, pl: null, isWin: null },
+  { date: '2026-03-19', ticker: 'MSFT', action: 'SELL', shares: 6, executionPrice: 405.0, pl: -198.0, isWin: false },
+  { date: '2026-03-18', ticker: 'META', action: 'BUY', shares: 8, executionPrice: 518.0, pl: null, isWin: null },
+  { date: '2026-03-17', ticker: 'NVDA', action: 'BUY', shares: 14, executionPrice: 114.5, pl: null, isWin: null },
+  { date: '2026-03-16', ticker: 'AMZN', action: 'SELL', shares: 12, executionPrice: 195.2, pl: 310.8, isWin: true },
+  { date: '2026-03-15', ticker: 'AAPL', action: 'SELL', shares: 8, executionPrice: 219.4, pl: -142.4, isWin: false },
+  { date: '2026-03-14', ticker: 'GOOGL', action: 'SELL', shares: 10, executionPrice: 170.1, pl: 96.5, isWin: true },
+  { date: '2026-03-13', ticker: 'MSFT', action: 'BUY', shares: 5, executionPrice: 412.3, pl: null, isWin: null },
+  { date: '2026-03-12', ticker: 'META', action: 'SELL', shares: 3, executionPrice: 514.2, pl: 48.6, isWin: true },
+  { date: '2026-03-11', ticker: 'NVDA', action: 'BUY', shares: 22, executionPrice: 110.9, pl: null, isWin: null },
+  { date: '2026-03-10', ticker: 'AMZN', action: 'BUY', shares: 15, executionPrice: 189.7, pl: null, isWin: null },
+  { date: '2026-03-09', ticker: 'AAPL', action: 'BUY', shares: 20, executionPrice: 224.8, pl: null, isWin: null },
+  { date: '2026-03-08', ticker: 'GOOGL', action: 'SELL', shares: 8, executionPrice: 168.0, pl: -62.4, isWin: false },
+  { date: '2026-03-07', ticker: 'MSFT', action: 'SELL', shares: 5, executionPrice: 418.6, pl: 285.5, isWin: true },
+  { date: '2026-03-06', ticker: 'META', action: 'BUY', shares: 6, executionPrice: 505.5, pl: null, isWin: null },
+  { date: '2026-03-05', ticker: 'NVDA', action: 'SELL', shares: 16, executionPrice: 108.2, pl: 412.8, isWin: true },
+  { date: '2026-03-04', ticker: 'AMZN', action: 'SELL', shares: 18, executionPrice: 188.1, pl: -221.4, isWin: false },
+  { date: '2026-03-03', ticker: 'AAPL', action: 'SELL', shares: 12, executionPrice: 227.3, pl: 378.6, isWin: true },
+  { date: '2026-03-02', ticker: 'GOOGL', action: 'BUY', shares: 18, executionPrice: 166.4, pl: null, isWin: null },
+  { date: '2026-03-01', ticker: 'MSFT', action: 'BUY', shares: 8, executionPrice: 401.2, pl: null, isWin: null },
+  { date: '2026-02-28', ticker: 'META', action: 'SELL', shares: 5, executionPrice: 499.8, pl: -198.5, isWin: false },
+  { date: '2026-02-27', ticker: 'NVDA', action: 'BUY', shares: 25, executionPrice: 107.1, pl: null, isWin: null },
+  { date: '2026-02-26', ticker: 'AMZN', action: 'BUY', shares: 10, executionPrice: 185.5, pl: null, isWin: null },
+  { date: '2026-02-25', ticker: 'AAPL', action: 'SELL', shares: 6, executionPrice: 231.2, pl: 192.3, isWin: true },
+  { date: '2026-02-24', ticker: 'GOOGL', action: 'SELL', shares: 14, executionPrice: 165.8, pl: 144.2, isWin: true },
+  { date: '2026-02-23', ticker: 'MSFT', action: 'SELL', shares: 4, executionPrice: 398.4, pl: -72.0, isWin: false },
+  { date: '2026-02-22', ticker: 'META', action: 'BUY', shares: 4, executionPrice: 522.0, pl: null, isWin: null },
+  { date: '2026-02-21', ticker: 'NVDA', action: 'SELL', shares: 10, executionPrice: 105.6, pl: 890.4, isWin: true },
+  { date: '2026-02-20', ticker: 'AMZN', action: 'SELL', shares: 25, executionPrice: 182.3, pl: 505.0, isWin: true },
+  { date: '2026-02-19', ticker: 'AAPL', action: 'BUY', shares: 30, executionPrice: 228.0, pl: null, isWin: null },
+  { date: '2026-02-18', ticker: 'GOOGL', action: 'BUY', shares: 8, executionPrice: 163.5, pl: null, isWin: null },
+  { date: '2026-02-17', ticker: 'MSFT', action: 'BUY', shares: 6, executionPrice: 395.0, pl: null, isWin: null },
+  { date: '2026-02-16', ticker: 'META', action: 'SELL', shares: 2, executionPrice: 510.0, pl: -42.0, isWin: false },
+];
+
+function filterSignalDemoTradeHistory(mode, tickerFilter) {
+  const all = [...SIGNAL_DEMO_TRADE_HISTORY_FULL_MOCK];
+  if (mode === 'ticker' && tickerFilter) {
+    const u = String(tickerFilter).toUpperCase();
+    return all.filter((r) => String(r.ticker).toUpperCase() === u);
+  }
+  if (mode === 'wins') {
+    return all.filter((r) => r.pl != null && r.pl > 0);
+  }
+  return all;
+}
+
+function AlgoExecutionBadge({ action }) {
+  const isBuy = String(action || '').toUpperCase() === 'BUY';
+  const Icon = isBuy ? CheckCircle : AlertTriangle;
+  return (
+    <span
+      className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-semibold uppercase tracking-wide border ${
+        isBuy
+          ? 'text-emerald-400 bg-emerald-400/10 border-emerald-400/25'
+          : 'text-red-400 bg-red-400/10 border-red-400/25'
+      }`}
+    >
+      <Icon className="w-3.5 h-3.5 shrink-0" />
+      {isBuy ? 'BUY' : 'SELL'}
+    </span>
+  );
+}
+
+function SignalDemoTradeHistoryModal({ open, title, subtitle, rows, onClose, onSelectStock }) {
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = '';
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6">
+      <div
+        className="absolute inset-0 bg-black/65 backdrop-blur-[2px]"
+        aria-hidden
+        onMouseDown={onClose}
+      />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="signal-demo-trade-history-title"
+        className={`relative w-full max-w-4xl max-h-[min(88vh,720px)] flex flex-col rounded-2xl border border-slate-700/80 shadow-2xl ${CARD_BASE} overflow-hidden z-[1]`}
+        style={{ boxShadow: '0 25px 50px -12px rgba(0,0,0,0.65), 0 0 0 1px rgba(56,189,248,0.12)' }}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="flex shrink-0 items-start justify-between gap-4 px-5 py-4 border-b border-slate-800 bg-[#0f1118]/95">
+          <div className="min-w-0">
+            <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-[0.18em] mb-1">Trade history</p>
+            <h2 id="signal-demo-trade-history-title" className="text-lg font-semibold text-white tracking-tight truncate">
+              {title}
+            </h2>
+            {subtitle ? <p className="text-xs text-gray-500 mt-1">{subtitle}</p> : null}
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="shrink-0 p-2 rounded-lg border border-slate-700/80 bg-slate-900/60 text-gray-400 hover:text-white hover:border-slate-500 hover:bg-slate-800/80 transition-colors"
+            aria-label="Close"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="flex-1 min-h-0 overflow-y-auto overflow-x-auto">
+          <table className="w-full text-left border-collapse min-w-[640px]">
+            <thead className="sticky top-0 bg-[#0f1118] border-b border-slate-800 z-[1]">
+              <tr>
+                <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Date</th>
+                <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider w-12" aria-label="Logo" />
+                <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Symbol</th>
+                <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Action</th>
+                <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Shares</th>
+                <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Price</th>
+                <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">P/L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="py-12 px-4 text-center text-sm text-gray-500">
+                    No trades match this view.
+                  </td>
+                </tr>
+              ) : (
+                rows.map((row, idx) => {
+                  const stock = getStockMeta(row.ticker);
+                  const pl = row.pl;
+                  const plShow = pl == null ? null : Number(pl);
+                  return (
+                    <tr
+                      key={`${row.date}-${row.ticker}-${idx}`}
+                      onClick={() => {
+                        if (stock && onSelectStock) {
+                          onSelectStock(stock);
+                          onClose();
+                        }
+                      }}
+                      className={`border-b border-slate-800/50 hover:bg-white/[0.04] transition-colors ${stock && onSelectStock ? 'cursor-pointer' : ''}`}
+                    >
+                      <td className="py-2.5 px-3 text-sm text-gray-300 tabular-nums whitespace-nowrap">{row.date}</td>
+                      <td className="py-2.5 px-3 align-middle">
+                        <StockLogo ticker={row.ticker} />
+                      </td>
+                      <td className="py-2.5 px-3 text-sm font-medium text-white tabular-nums">{row.ticker}</td>
+                      <td className="py-2.5 px-3 align-middle">
+                        <AlgoExecutionBadge action={row.action} />
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-300 tabular-nums">{row.shares}</td>
+                      <td className="py-2.5 px-3 text-right text-sm text-white tabular-nums">
+                        ${Number(row.executionPrice).toFixed(2)}
+                      </td>
+                      <td
+                        className={`py-2.5 px-3 text-right text-sm font-semibold tabular-nums ${
+                          plShow == null ? 'text-gray-600' : plShow >= 0 ? 'text-emerald-400' : 'text-red-400'
+                        }`}
+                      >
+                        {plShow == null ? '—' : `${plShow >= 0 ? '+' : ''}$${Math.abs(plShow).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="shrink-0 px-5 py-3 border-t border-slate-800 bg-[#12131a]/95 text-[11px] text-gray-500">
+          {rows.length} row{rows.length !== 1 ? 's' : ''} in this view · paperbook simulation
+        </div>
+      </div>
+    </div>
+  );
+}
 
 const STOCK_ABOUT = {
   AAPL:  "Apple Inc. designs, manufactures and markets consumer electronics, software and services. Its product ecosystem spans the iPhone, Mac, iPad, Apple Watch and AirPods, bolstered by a rapidly expanding suite of subscription services — iCloud, Apple TV+, Apple Arcade and Apple Pay — that drive high-margin recurring revenue.",
@@ -789,7 +1101,174 @@ function AIRatingGauge({ ticker, score, models = [] }) {
   );
 }
 
-function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
+const CHART_TIME_RANGE_OPTIONS = [
+  { value: '1d', label: '1D' },
+  { value: '1mo', label: '1M' },
+  { value: '3mo', label: '3M' },
+  { value: '6mo', label: '6M' },
+  { value: '1y', label: '1Y' },
+];
+
+function formatUsdPortfolio(n) {
+  if (n == null || !Number.isFinite(Number(n))) return '—';
+  return Number(n).toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/** Demo backtest card; fetches `/api/portfolio/simulate` for the active ticker and chart time range. */
+function DemoPortfolioSimulator({ ticker, timeRange, accentColor }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const url = `${API_BASE_URL}/api/portfolio/simulate?ticker=${encodeURIComponent(ticker)}&time_range=${encodeURIComponent(timeRange)}`;
+        const res = await fetch(url);
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(errText || `Request failed (${res.status})`);
+        }
+        const json = await res.json();
+        if (!cancelled) setData(json);
+      } catch (e) {
+        if (!cancelled) {
+          setError(e?.message || 'Failed to load simulation');
+          setData(null);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [ticker, timeRange]);
+
+  const initialBal = Number.isFinite(Number(data?.initial_balance)) ? Number(data.initial_balance) : 10_000;
+  const finalBal = Number.isFinite(Number(data?.final_balance)) ? Number(data.final_balance) : null;
+  const roi = Number.isFinite(Number(data?.total_roi_pct)) ? Number(data.total_roi_pct) : null;
+  const trades = Array.isArray(data?.trades) ? data.trades : [];
+
+  return (
+    <div className={`${CARD_BASE} p-6 mb-6`}>
+      <div className="mb-5">
+        <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-[0.18em]">
+          Mock Portfolio (Algo Trading)
+        </h3>
+        <p className="text-[11px] text-gray-600 mt-1.5 leading-relaxed">
+          Hypothetical $10k all-in backtest for{' '}
+          <span className="text-gray-400 font-medium tabular-nums">{ticker}</span> using the same range as the price chart (
+          <span className="text-gray-400 uppercase">{timeRange}</span>). For illustration only.
+        </p>
+      </div>
+
+      {loading && (
+        <div className="flex flex-col items-center justify-center py-14 gap-4">
+          <div className="relative flex items-center justify-center">
+            <span
+              className="absolute inline-flex h-10 w-10 rounded-full opacity-30 animate-ping"
+              style={{ backgroundColor: accentColor }}
+            />
+            <span
+              className="relative inline-flex h-5 w-5 rounded-full"
+              style={{ backgroundColor: accentColor }}
+            />
+          </div>
+          <p className="text-sm font-medium tracking-widest uppercase animate-pulse" style={{ color: accentColor }}>
+            Running simulation…
+          </p>
+        </div>
+      )}
+
+      {!loading && error && <p className="text-sm text-red-400/90 py-6 text-center">{error}</p>}
+
+      {!loading && !error && data && (
+        <>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-5">
+            <div className="rounded-lg border border-slate-800/70 bg-slate-900/35 px-4 py-3">
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">Initial Balance</p>
+              <p className="text-lg font-bold text-white tabular-nums">{formatUsdPortfolio(initialBal)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-800/70 bg-slate-900/35 px-4 py-3">
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">Final Balance</p>
+              <p className="text-lg font-bold text-white tabular-nums">{formatUsdPortfolio(finalBal)}</p>
+            </div>
+            <div className="rounded-lg border border-slate-800/70 bg-slate-900/35 px-4 py-3">
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-1">Total ROI</p>
+              <p
+                className={`text-lg font-bold tabular-nums ${
+                  roi == null ? 'text-gray-300' : roi > 0 ? 'text-emerald-400' : roi < 0 ? 'text-red-400' : 'text-gray-300'
+                }`}
+              >
+                {roi == null ? '—' : `${roi > 0 ? '+' : ''}${roi.toFixed(2)}%`}
+              </p>
+            </div>
+          </div>
+
+          <div className="border-t border-slate-800/60 pt-4">
+            <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-[0.18em] mb-3">Trade history</p>
+            <div className="rounded-lg border border-slate-800/70 overflow-hidden bg-[#0f1118] max-h-[220px] overflow-y-auto">
+              <table className="w-full text-left border-collapse text-sm" aria-label="Simulated trades">
+                <thead className="sticky top-0 bg-[#0f1118] border-b border-slate-800 z-[1]">
+                  <tr>
+                    <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Date</th>
+                    <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Action</th>
+                    <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">
+                      Execution Price
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trades.length === 0 ? (
+                    <tr>
+                      <td colSpan={3} className="py-8 px-3 text-center text-xs text-gray-500">
+                        No trades in this window (signal stayed neutral or window too short).
+                      </td>
+                    </tr>
+                  ) : (
+                    trades.map((row, idx) => {
+                      const act = String(row.action || '').toUpperCase();
+                      const isBuy = act === 'BUY';
+                      return (
+                        <tr
+                          key={`${row.date}-${idx}`}
+                          className="border-b border-slate-800/40 last:border-0 hover:bg-white/[0.03]"
+                        >
+                          <td className="py-2.5 px-3 text-gray-300 tabular-nums text-xs">{row.date}</td>
+                          <td className="py-2.5 px-3">
+                            <span
+                              className={`inline-flex items-center text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-md border ${
+                                isBuy
+                                  ? 'text-emerald-400 bg-emerald-400/10 border-emerald-500/30'
+                                  : 'text-red-400 bg-red-400/10 border-red-500/30'
+                              }`}
+                            >
+                              {act || '—'}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-right text-gray-200 tabular-nums">
+                            {formatUsdPortfolio(Number(row.execution_price))}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, onToggleWatchlist }) {
   const [currentPrice, setCurrentPrice] = useState(stock.price);
   const [priceChange, setPriceChange] = useState(
     typeof stock.changePercent === 'number' ? ((stock.changePercent / 100) * stock.price) : 0,
@@ -800,8 +1279,8 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
   const [isChartSyncing, setIsChartSyncing] = useState(false);
   const [isFallback, setIsFallback] = useState(false);
   const [lastChartSynced, setLastChartSynced] = useState(null);
+  const [chartTimeRange, setChartTimeRange] = useState('3mo');
   const [showConsensusExplainer, setShowConsensusExplainer] = useState(false);
-  const [predictionDays, setPredictionDays] = useState(0);
   const initialSyncNotifiedRef = useRef(false);
   const isGain = (percentageChange ?? 0) >= 0;
   // `color` drives the price-chart gradient and the About card left-border accent (price direction)
@@ -836,7 +1315,6 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
 
   useEffect(() => {
     initialSyncNotifiedRef.current = false;
-    setPredictionDays(0);
   }, [stock.ticker]);
 
   useEffect(() => {
@@ -864,21 +1342,26 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
     };
   }, [stock.ticker]);
 
-  // Fetch chart + forecast data from the FastAPI Python backend (single request)
+  // Fetch chart data from FastAPI (/api/analyze) — historical prices only (no forecast UI)
   useEffect(() => {
     let cancelled = false;
     setFullChartData([]);
     setIsFallback(false);
     const fetchChart = async () => {
       setIsChartSyncing(true);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 20_000);
       try {
-        // ✏️ FastAPI backend URL — change host/port here if your server runs elsewhere
-        const url = `https://globalmarketpredictor.onrender.com/api/analyze?ticker=${encodeURIComponent(stock.ticker)}&time_range=3mo`;
-        const res = await fetch(url);
+        const url = `${API_BASE_URL}/api/analyze?ticker=${encodeURIComponent(stock.ticker)}&time_range=${encodeURIComponent(chartTimeRange)}`;
+        const res = await fetch(url, { signal: controller.signal });
         if (!res.ok) throw new Error(`API returned ${res.status} ${res.statusText}`);
         const json = await res.json();
         if (!cancelled) {
-          setFullChartData(Array.isArray(json.chart_data) ? json.chart_data : []);
+          const raw = Array.isArray(json.chart_data) ? json.chart_data : [];
+          const chartData = raw
+            .filter((d) => d != null && d.price != null)
+            .map((d) => ({ date: d.date, price: d.price }));
+          setFullChartData(chartData);
           setIsFallback(false);
           setLastChartSynced(Date.now());
         }
@@ -893,35 +1376,15 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
           setIsFallback(true);
         }
       } finally {
+        clearTimeout(timeoutId);
         if (!cancelled) setIsChartSyncing(false);
       }
     };
     fetchChart();
     return () => { cancelled = true; };
-  }, [stock.ticker]);
+  }, [stock.ticker, chartTimeRange]);
 
-  // Show recent history + forecast so the prediction isn't visually compressed.
-  // When the slider is off we show all history; when on, zoom to last 5 days.
-  const displayData = useMemo(() => {
-    if (!fullChartData.length) return [];
-    const allHistory = fullChartData.filter((d) => d.price != null);
-    if (predictionDays <= 0) return allHistory;
-    const history = allHistory.slice(-5);
-    const forecast = fullChartData.filter((d) => d.price === null).slice(0, predictionDays);
-    return [...history, ...forecast];
-  }, [fullChartData, predictionDays]);
-
-  console.log('Display Data:', displayData);
-
-  const forecastColor = useMemo(() => {
-    if (predictionDays <= 0 || !displayData.length) return '#00d2ff';
-    const histPoints = displayData.filter((d) => d.price != null);
-    const predPoints = displayData.filter((d) => d.predictedPrice != null && d.price == null);
-    if (!histPoints.length || !predPoints.length) return '#00d2ff';
-    const lastHistPrice = histPoints[histPoints.length - 1].price;
-    const finalPredPrice = predPoints[predPoints.length - 1].predictedPrice;
-    return finalPredPrice >= lastHistPrice ? '#10b981' : '#ef4444';
-  }, [displayData, predictionDays]);
+  const displayData = useMemo(() => fullChartData, [fullChartData]);
 
   return (
     <div
@@ -954,6 +1417,20 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
             <span className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full border ${signalBadgeCls}`}>
               <SignalIcon className="w-3.5 h-3.5 shrink-0" />{signalLabel}
             </span>
+            {onToggleWatchlist && (
+              <button
+                type="button"
+                onClick={() => onToggleWatchlist(stock.ticker)}
+                className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1 rounded-full border transition-colors ${
+                  isInWatchlist
+                    ? 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                    : 'border-slate-600 bg-slate-800/40 text-gray-400 hover:text-white hover:border-slate-500'
+                }`}
+              >
+                <Star className={`w-3.5 h-3.5 shrink-0 ${isInWatchlist ? 'fill-amber-400 text-amber-400' : ''}`} />
+                {isInWatchlist ? 'Watching' : 'Add to watchlist'}
+              </button>
+            )}
           </div>
           <p className="text-gray-400 text-base">{stock.name}</p>
         </div>
@@ -980,11 +1457,25 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
 
       {/* ── Main chart ── */}
       <div className={`${CARD_BASE} p-6 mb-6`}>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
           <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-[0.18em]">
-            Price History {predictionDays > 0 ? `+ ${predictionDays}-Day AI Forecast` : '(Live)'}
+            Price History (Live)
           </h3>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+            {CHART_TIME_RANGE_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => setChartTimeRange(opt.value)}
+                className={`text-[10px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded-md border transition-colors ${
+                  chartTimeRange === opt.value
+                    ? 'border-emerald-500/45 bg-emerald-500/10 text-emerald-300'
+                    : 'border-slate-700/60 bg-slate-900/40 text-gray-500 hover:text-gray-300 hover:border-slate-600'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
             {isChartSyncing && fullChartData.length > 0 && (
               <span className="text-[10px] text-emerald-400 animate-pulse uppercase tracking-wider">Syncing...</span>
             )}
@@ -999,25 +1490,6 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
               </span>
             )}
           </div>
-        </div>
-
-        {/* ── AI Forecast Slider (0 = off, 1–7 days) ── */}
-        <div className="flex items-center gap-4 mb-4 px-1">
-          <label className="text-[11px] font-semibold text-gray-500 uppercase tracking-wider whitespace-nowrap">
-            AI Forecast
-          </label>
-          <input
-            type="range"
-            min={0}
-            max={7}
-            step={1}
-            value={predictionDays}
-            onChange={(e) => setPredictionDays(Number(e.target.value))}
-            className="flex-1 h-1 accent-cyan-400 cursor-pointer"
-          />
-          <span className="text-xs text-gray-400 tabular-nums min-w-[4rem] text-right">
-            {predictionDays === 0 ? 'Off' : `${predictionDays} day${predictionDays > 1 ? 's' : ''}`}
-          </span>
         </div>
 
         <div className="h-[300px]">
@@ -1041,7 +1513,7 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
             </div>
           )}
 
-          {/* ── Chart (historical + AI forecast overlay) ── */}
+          {/* ── Chart (historical) ── */}
           {displayData.length > 0 && (
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={displayData} margin={{ top: 8, right: 8, left: 8, bottom: 4 }}>
@@ -1070,7 +1542,6 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
                   content={({ active, payload, label }) => {
                     if (!active || !payload?.length) return null;
                     const hist = payload.find((p) => p.dataKey === 'price')?.value;
-                    const pred = payload.find((p) => p.dataKey === 'predictedPrice')?.value;
                     return (
                       <div style={{
                         backgroundColor: 'rgba(12,15,24,0.95)',
@@ -1082,9 +1553,6 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
                         <p style={{ color: '#9ca3af', fontSize: 11, marginBottom: 4 }}>{label}</p>
                         {hist != null && (
                           <p style={{ color, fontSize: 13, fontWeight: 600 }}>{stock.ticker}: ${Number(hist).toFixed(2)}</p>
-                        )}
-                        {pred != null && (
-                          <p style={{ color: forecastColor, fontSize: 13, fontWeight: 600 }}>AI Forecast: ${Number(pred).toFixed(2)}</p>
                         )}
                       </div>
                     );
@@ -1100,17 +1568,6 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
                   activeDot={{ r: 4, strokeWidth: 0, fill: color }}
                   connectNulls={true}
                 />
-                <Area
-                  type="monotone"
-                  dataKey="predictedPrice"
-                  stroke={forecastColor}
-                  strokeWidth={2}
-                  strokeDasharray="5 5"
-                  fillOpacity={0}
-                  dot={false}
-                  activeDot={{ r: 4, strokeWidth: 0, fill: forecastColor }}
-                  connectNulls={true}
-                />
               </AreaChart>
             </ResponsiveContainer>
           )}
@@ -1119,6 +1576,8 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete }) {
           <LiveIndicator lastSynced={lastChartSynced ?? lastSynced} />
         </div>
       </div>
+
+      <DemoPortfolioSimulator ticker={stock.ticker} timeRange={chartTimeRange} accentColor={color} />
 
       {/* ── 4-column stats grid ── */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
@@ -1495,10 +1954,346 @@ function SentimentGauge({ value, historical = [] }) {
   );
 }
 
-function HomeDashboard({ onSelectStock }) {
+function SignalDemoPortfolioPage({ onSelectStock }) {
+  const [liveQuotes, setLiveQuotes] = useState({});
+  const [lastSynced, setLastSynced] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tickers = DEMO_PORTFOLIO_HOLDINGS.map((h) => h.ticker);
+    const poll = async () => {
+      const entries = await Promise.all(tickers.map(async (t) => [t, await fetchLiveQuote(t)]));
+      if (cancelled) return;
+      const next = {};
+      entries.forEach(([ticker, quote]) => {
+        if (quote) next[ticker] = quote;
+      });
+      if (Object.keys(next).length > 0) {
+        setLiveQuotes((prev) => ({ ...prev, ...next }));
+        setLastSynced(Date.now());
+      }
+    };
+    poll();
+    const id = setInterval(poll, LIVE_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  const rows = useMemo(() => buildDemoPortfolioRows(liveQuotes), [liveQuotes]);
+  const totals = useMemo(() => sumDemoPortfolioTotals(rows), [rows]);
+  const buyCount = useMemo(() => rows.filter((r) => (r.aiScore ?? 0) >= 66).length, [rows]);
+
+  const [tradeHistoryModal, setTradeHistoryModal] = useState(null);
+  const closeTradeHistoryModal = useCallback(() => setTradeHistoryModal(null), []);
+  const modalTradeRows = useMemo(() => {
+    if (!tradeHistoryModal) return [];
+    if (tradeHistoryModal.filterMode === 'ticker') {
+      return filterSignalDemoTradeHistory('ticker', tradeHistoryModal.ticker);
+    }
+    if (tradeHistoryModal.filterMode === 'wins') return filterSignalDemoTradeHistory('wins');
+    return filterSignalDemoTradeHistory('all');
+  }, [tradeHistoryModal]);
+
+  const perfStatCardClass = `${CARD_BASE} p-5 border-sky-500/20 w-full text-left transition-all duration-200 cursor-pointer hover:border-sky-400/45 hover:bg-sky-500/[0.08] hover:shadow-[0_0_28px_rgba(56,189,248,0.12)] focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/45 focus-visible:ring-offset-2 focus-visible:ring-offset-[#0B0E14] active:scale-[0.99]`;
+
+  return (
+    <div className="w-full min-h-full py-6 md:py-8 px-6 md:px-10 box-border overflow-x-hidden" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
+      <div className="max-w-6xl mx-auto flex flex-col gap-6">
+        <div className={`${CARD_BASE} p-6 md:p-8 border-sky-500/20`}>
+          <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+            <div className="flex items-start gap-3 min-w-0">
+              <div className="p-2.5 rounded-xl bg-sky-500/10 border border-sky-500/25 shrink-0">
+                <Briefcase className="w-6 h-6 text-sky-400" />
+              </div>
+              <div>
+                <h2 className="text-xl md:text-2xl font-semibold text-white tracking-tight">Signal-based demo portfolio</h2>
+                <p className="text-sm text-gray-400 mt-2 leading-relaxed max-w-2xl">
+                  Hypothetical paper positions aligned with the same <span className="text-gray-300">AI composite score</span> and signal bands
+                  (Strong Buy / Buy / Hold / Sell) used on each stock&apos;s detail page. Quotes refresh on the same cadence as the home dashboard.
+                  Not investment advice.
+                </p>
+                <p className="text-xs text-gray-500 mt-3">
+                  <span className="text-gray-400 tabular-nums">{buyCount}</span> of {rows.length} demo names are currently Buy or Strong Buy (score ≥ 66).
+                </p>
+              </div>
+            </div>
+            <LiveIndicator lastSynced={lastSynced} />
+          </div>
+        </div>
+
+        {/* Performance statistics — mock until API */}
+        <div>
+          <div className="flex flex-col gap-0.5 mb-3 px-0.5">
+            <p className="text-[10px] font-semibold text-gray-600 uppercase tracking-[0.2em]">STATISTICS</p>
+            <h3 className="text-sm font-semibold text-white uppercase tracking-wider">Performance statistics</h3>
+            <p className="text-[11px] text-gray-600 mt-1">Click a card to open the trade blotter — filtered to match the metric.</p>
+          </div>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <button
+              type="button"
+              className={perfStatCardClass}
+              onClick={() =>
+                setTradeHistoryModal({
+                  filterMode: 'all',
+                  title: 'All executed trades',
+                  subtitle: `Full demo blotter (${SIGNAL_DEMO_TRADE_HISTORY_FULL_MOCK.length} legs). Headline count shows model lifetime; detail view is illustrative.`,
+                })
+              }
+            >
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Total trades executed</p>
+              <p className="text-2xl font-bold text-white tabular-nums tracking-tight">
+                {SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.totalTradesExecuted}
+              </p>
+            </button>
+            <button
+              type="button"
+              className={perfStatCardClass}
+              onClick={() =>
+                setTradeHistoryModal({
+                  filterMode: 'wins',
+                  title: 'Winning trades (realized)',
+                  subtitle: 'Sell legs with positive realized P/L — drill-down for the headline win rate.',
+                })
+              }
+            >
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Win rate</p>
+              <p className="text-2xl font-bold text-white tabular-nums tracking-tight">
+                {SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.winRatePct.toFixed(1)}%
+              </p>
+            </button>
+            <button
+              type="button"
+              className={perfStatCardClass}
+              onClick={() => {
+                const tk = SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.bestTrade.ticker;
+                setTradeHistoryModal({
+                  filterMode: 'ticker',
+                  ticker: tk,
+                  title: `Trades · ${tk}`,
+                  subtitle: `All executions for ${tk} in the demo book — matches “best performing” headline name.`,
+                });
+              }}
+            >
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Best performing trade</p>
+              <p className="text-lg font-bold text-white tabular-nums tracking-tight">
+                {SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.bestTrade.ticker}
+              </p>
+              <p className="text-sm font-semibold text-emerald-400 tabular-nums mt-1">
+                {SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.bestTrade.label}
+              </p>
+              <p className="text-[11px] text-gray-500 mt-0.5">{SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.bestTrade.sub}</p>
+            </button>
+            <button
+              type="button"
+              className={perfStatCardClass}
+              onClick={() => {
+                const tk = SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.worstTrade.ticker;
+                setTradeHistoryModal({
+                  filterMode: 'ticker',
+                  ticker: tk,
+                  title: `Trades · ${tk}`,
+                  subtitle: `All executions for ${tk} in the demo book — matches “worst performing” headline name.`,
+                });
+              }}
+            >
+              <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Worst performing trade</p>
+              <p className="text-lg font-bold text-white tabular-nums tracking-tight">
+                {SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.worstTrade.ticker}
+              </p>
+              <p className="text-sm font-semibold text-red-400 tabular-nums mt-1">
+                {SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.worstTrade.label}
+              </p>
+              <p className="text-[11px] text-gray-500 mt-0.5">{SIGNAL_DEMO_ALGO_PERFORMANCE_MOCK.worstTrade.sub}</p>
+            </button>
+          </div>
+        </div>
+
+        <div className={`${CARD_BASE} overflow-hidden`}>
+          <div className="bg-[#12131a] border-b border-slate-800 px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <TrendingUp className="w-4 h-4 text-emerald-400 shrink-0" />
+              <h3 className="text-sm font-semibold text-white uppercase tracking-wider">Holdings &amp; live marks</h3>
+            </div>
+            <div className="flex flex-wrap gap-4 text-xs sm:text-sm tabular-nums">
+              <div>
+                <p className="text-[10px] uppercase tracking-wider text-gray-500">Market value</p>
+                <p className="text-white font-semibold">
+                  ${totals.marketValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase tracking-wider text-gray-500">Cost basis</p>
+                <p className="text-gray-300 font-medium">
+                  ${totals.costBasis.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase tracking-wider text-gray-500">Total P/L</p>
+                <p className={`font-semibold ${totals.pl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {totals.pl >= 0 ? '+' : ''}
+                  ${totals.pl.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  <span className="text-[11px] ml-1">
+                    ({totals.plPct >= 0 ? '+' : ''}
+                    {totals.plPct.toFixed(2)}%)
+                  </span>
+                </p>
+              </div>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse min-w-[720px]">
+              <thead className="bg-[#0f1118] border-b border-slate-800">
+                <tr>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider w-12" aria-label="Logo" />
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Symbol</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">AI signal</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Score</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider hidden md:table-cell">Thesis</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Shares</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Avg cost</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Price</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Value</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">P/L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => {
+                  const stock = getStockMeta(row.ticker);
+                  const SigIcon = row.signal?.Icon ?? Minus;
+                  return (
+                    <tr
+                      key={row.ticker}
+                      onClick={() => stock && onSelectStock(stock)}
+                      className={`border-b border-slate-800/50 hover:bg-white/5 transition-colors ${stock ? 'cursor-pointer' : ''}`}
+                    >
+                      <td className="py-2.5 px-3 align-top">
+                        <StockLogo ticker={row.ticker} />
+                      </td>
+                      <td className="py-2.5 px-3 align-top">
+                        <p className="font-medium text-white text-sm">{row.ticker}</p>
+                        <p className="text-[11px] text-gray-500 mt-0.5 md:hidden line-clamp-2">{row.aiSummary}</p>
+                      </td>
+                      <td className="py-2.5 px-3 align-top">
+                        <span
+                          className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-semibold uppercase tracking-wide border ${row.signal?.bgCls ?? ''} ${row.signal?.textCls ?? 'text-gray-400'} ${row.signal?.borderCls ?? 'border-slate-700'}`}
+                        >
+                          <SigIcon className="w-3.5 h-3.5 shrink-0" />
+                          {row.signal?.label ?? '—'}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-200 tabular-nums align-top font-medium">{row.aiScore}</td>
+                      <td
+                        className="py-2.5 px-3 text-xs text-gray-400 align-top max-w-[20rem] leading-snug hidden md:table-cell"
+                        title={row.aiSummary}
+                      >
+                        {row.aiSummary}
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-300 tabular-nums align-top">{row.shares}</td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-300 tabular-nums align-top">${row.avgCost.toFixed(2)}</td>
+                      <td className="py-2.5 px-3 text-right text-sm text-white tabular-nums align-top">${row.price.toFixed(2)}</td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-200 tabular-nums font-medium align-top">
+                        ${row.marketValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                      <td
+                        className={`py-2.5 px-3 text-right text-sm font-semibold tabular-nums align-top ${row.pl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}
+                      >
+                        {row.pl >= 0 ? '+' : ''}${row.pl.toFixed(2)}
+                        <span className="text-[11px] font-normal ml-1">
+                          ({row.plPct >= 0 ? '+' : ''}
+                          {row.plPct.toFixed(1)}%)
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Recent model actions — mock until API */}
+        <div className={`${CARD_BASE} overflow-hidden`}>
+          <div className="bg-[#12131a] border-b border-slate-800 px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5">
+            <div>
+              <p className="text-[10px] font-semibold text-gray-600 uppercase tracking-[0.2em] mb-1">LATEST ACTIVITY</p>
+              <div className="flex items-center gap-2">
+                <TrendingUp className="w-4 h-4 text-sky-400 shrink-0" />
+                <h3 className="text-sm font-semibold text-white uppercase tracking-wider">Recent model actions</h3>
+              </div>
+            </div>
+            <p className="text-[10px] text-gray-600 uppercase tracking-wider">Last 8 executions · paperbook</p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse min-w-[780px]">
+              <thead className="bg-[#0f1118] border-b border-slate-800">
+                <tr>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Date</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider w-12" aria-label="Logo" />
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Symbol</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Action</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Shares</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Execution price</th>
+                </tr>
+              </thead>
+              <tbody>
+                {SIGNAL_DEMO_RECENT_MODEL_ACTIONS_MOCK.map((row, idx) => {
+                  const stock = getStockMeta(row.ticker);
+                  return (
+                    <tr
+                      key={`${row.date}-${row.ticker}-${idx}`}
+                      onClick={() => stock && onSelectStock(stock)}
+                      className={`border-b border-slate-800/50 hover:bg-white/5 transition-colors ${stock ? 'cursor-pointer' : ''}`}
+                    >
+                      <td className="py-2.5 px-3 text-sm text-gray-300 tabular-nums">{row.date}</td>
+                      <td className="py-2.5 px-3 align-middle">
+                        <StockLogo ticker={row.ticker} />
+                      </td>
+                      <td className="py-2.5 px-3 align-middle">
+                        <span className="font-medium text-white text-sm tabular-nums">{row.ticker}</span>
+                      </td>
+                      <td className="py-2.5 px-3 align-middle">
+                        <AlgoExecutionBadge action={row.action} />
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-300 tabular-nums">{row.shares}</td>
+                      <td className="py-2.5 px-3 text-right text-sm text-white tabular-nums">
+                        ${Number(row.executionPrice).toFixed(2)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className={`${CARD_BASE} p-5 border border-slate-800/80`}>
+          <p className="text-xs font-semibold uppercase tracking-[0.15em] text-gray-500 mb-2">Signal methodology</p>
+          <p className="text-sm text-gray-400 leading-relaxed">
+            Scores (0–100) and labels follow the same thresholds as the rest of the app: Strong Buy (85+), Buy (66–84), Hold (41–65), Sell (40 and below).
+            Demo share counts and average cost are static illustrations; only marks and P/L update with live quotes.
+          </p>
+        </div>
+      </div>
+
+      <SignalDemoTradeHistoryModal
+        open={Boolean(tradeHistoryModal)}
+        title={tradeHistoryModal?.title ?? ''}
+        subtitle={tradeHistoryModal?.subtitle}
+        rows={modalTradeRows}
+        onClose={closeTradeHistoryModal}
+        onSelectStock={onSelectStock}
+      />
+    </div>
+  );
+}
+
+function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onToggleWatchlist }) {
   const [sentimentValue, setSentimentValue] = useState(22);
   const [sentimentLastSynced, setSentimentLastSynced] = useState(null);
   const [liveQuotes, setLiveQuotes] = useState({});
+  const [watchlistQuotes, setWatchlistQuotes] = useState({});
   const [isSyncingTables, setIsSyncingTables] = useState(false);
   const [lastTablesSynced, setLastTablesSynced] = useState(null);
   useEffect(() => {
@@ -1552,6 +2347,47 @@ function HomeDashboard({ onSelectStock }) {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    const tickers = Array.isArray(watchlistTickers) ? watchlistTickers.filter(Boolean) : [];
+    const fetchWatchlistQuotes = async () => {
+      if (tickers.length === 0) {
+        if (!cancelled) setWatchlistQuotes({});
+        return;
+      }
+      const entries = await Promise.all(
+        tickers.map(async (ticker) => [ticker, await fetchLiveQuote(ticker)]),
+      );
+      if (cancelled) return;
+      const next = {};
+      entries.forEach(([ticker, quote]) => {
+        if (quote) next[ticker] = quote;
+      });
+      if (Object.keys(next).length > 0) setWatchlistQuotes((prev) => ({ ...prev, ...next }));
+    };
+    fetchWatchlistQuotes();
+    const id = setInterval(fetchWatchlistQuotes, LIVE_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [watchlistTickers]);
+
+  const watchlistRows = useMemo(
+    () =>
+      (Array.isArray(watchlistTickers) ? watchlistTickers : []).map((ticker) => {
+        const meta = getStockMeta(ticker);
+        const q = watchlistQuotes[ticker];
+        return {
+          ticker,
+          name: meta?.name ?? ticker,
+          price: q?.price ?? meta?.price ?? 0,
+          changePercent: q?.changePercent ?? meta?.changePercent ?? 0,
+        };
+      }),
+    [watchlistTickers, watchlistQuotes],
+  );
+
   const stocksWithLive = useMemo(
     () => TOP_US_STOCKS.map((stock) => {
       const q = liveQuotes[stock.ticker];
@@ -1559,6 +2395,10 @@ function HomeDashboard({ onSelectStock }) {
     }),
     [liveQuotes],
   );
+
+  const demoPortfolioRows = useMemo(() => buildDemoPortfolioRows(liveQuotes), [liveQuotes]);
+  const demoPortfolioTotals = useMemo(() => sumDemoPortfolioTotals(demoPortfolioRows), [demoPortfolioRows]);
+
   const fearGreedTimelineData = [
     { month: 'Jan', fearGreed: 31, sp500: 4720 },
     { month: 'Feb', fearGreed: 38, sp500: 4890 },
@@ -1716,6 +2556,172 @@ function HomeDashboard({ onSelectStock }) {
           </div>
         </div>
 
+        {/* Demo portfolio */}
+        <div className={`${CARD_BASE} overflow-hidden w-full mt-6`}>
+          <div className="bg-[#12131a] border-b border-slate-800 px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <Briefcase className="w-4 h-4 text-sky-400 shrink-0" />
+              <div>
+                <h3 className="text-sm font-semibold text-white uppercase tracking-wider">Demo Portfolio</h3>
+                <p className="text-[10px] text-gray-500 mt-0.5">
+                  Sample holdings tied to AI signals — open <span className="text-gray-400">Signal portfolio</span> in the header for the full view.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-4 text-xs sm:text-sm tabular-nums">
+              <div>
+                <p className="text-[10px] uppercase tracking-wider text-gray-500">Market value</p>
+                <p className="text-white font-semibold">${demoPortfolioTotals.marketValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase tracking-wider text-gray-500">Cost basis</p>
+                <p className="text-gray-300 font-medium">${demoPortfolioTotals.costBasis.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+              </div>
+              <div>
+                <p className="text-[10px] uppercase tracking-wider text-gray-500">Total P/L</p>
+                <p className={`font-semibold ${demoPortfolioTotals.pl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                  {demoPortfolioTotals.pl >= 0 ? '+' : ''}
+                  ${demoPortfolioTotals.pl.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  <span className="text-[11px] ml-1">
+                    ({demoPortfolioTotals.plPct >= 0 ? '+' : ''}{demoPortfolioTotals.plPct.toFixed(2)}%)
+                  </span>
+                </p>
+              </div>
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse min-w-[640px]">
+              <thead className="bg-[#0f1118] border-b border-slate-800">
+                <tr>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider w-12" aria-label="Logo" />
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Symbol</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider hidden lg:table-cell">AI signal</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider hidden md:table-cell">Name</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Shares</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Avg cost</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Price</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Value</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">P/L</th>
+                </tr>
+              </thead>
+              <tbody>
+                {demoPortfolioRows.map((row) => {
+                  const stock = getStockMeta(row.ticker);
+                  const SigIcon = row.signal?.Icon ?? Minus;
+                  return (
+                    <tr
+                      key={row.ticker}
+                      onClick={() => stock && onSelectStock(stock)}
+                      className={`border-b border-slate-800/50 hover:bg-white/5 transition-colors ${stock ? 'cursor-pointer' : ''}`}
+                    >
+                      <td className="py-2.5 px-3"><StockLogo ticker={row.ticker} /></td>
+                      <td className="py-2.5 px-3 font-medium text-white text-sm">{row.ticker}</td>
+                      <td className="py-2.5 px-3 hidden lg:table-cell">
+                        <span
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wide border ${row.signal?.bgCls ?? ''} ${row.signal?.textCls ?? 'text-gray-400'} ${row.signal?.borderCls ?? 'border-slate-700'}`}
+                          title={`Score ${row.aiScore}`}
+                        >
+                          <SigIcon className="w-3 h-3 shrink-0" />
+                          {row.signal?.label ?? '—'}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-3 text-sm text-gray-400 truncate hidden md:table-cell max-w-[12rem]" title={row.name}>
+                        {row.name}
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-300 tabular-nums">{row.shares}</td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-300 tabular-nums">${row.avgCost.toFixed(2)}</td>
+                      <td className="py-2.5 px-3 text-right text-sm text-white tabular-nums">${row.price.toFixed(2)}</td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-200 tabular-nums font-medium">
+                        ${row.marketValue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </td>
+                      <td className={`py-2.5 px-3 text-right text-sm font-semibold tabular-nums ${row.pl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                        {row.pl >= 0 ? '+' : ''}${row.pl.toFixed(2)}
+                        <span className="text-[11px] font-normal ml-1">({row.plPct >= 0 ? '+' : ''}{row.plPct.toFixed(1)}%)</span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Watchlist */}
+        <div className={`${CARD_BASE} overflow-hidden w-full mt-6`}>
+          <div className="bg-[#12131a] border-b border-slate-800 px-4 py-3 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <Star className="w-4 h-4 text-amber-400 shrink-0 fill-amber-400/25" />
+              <h3 className="text-sm font-semibold text-white uppercase tracking-wider truncate">My Watchlist</h3>
+              <span className="text-[10px] text-gray-500 tabular-nums shrink-0">
+                {watchlistRows.length}/{WATCHLIST_MAX}
+              </span>
+            </div>
+          </div>
+          {watchlistRows.length === 0 ? (
+            <div className="px-4 py-8 text-center text-sm text-gray-500">
+              No symbols yet. Open a stock and use <span className="text-gray-400">Add to watchlist</span>.
+            </div>
+          ) : (
+            <table className="w-full text-left border-collapse">
+              <thead className="bg-[#0f1118] border-b border-slate-800">
+                <tr>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider w-12" aria-label="Logo" />
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Symbol</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider hidden sm:table-cell">Name</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Price</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">Chg %</th>
+                  <th className="py-2.5 px-3 w-10" aria-label="Remove" />
+                </tr>
+              </thead>
+              <tbody>
+                {watchlistRows.map((row) => {
+                  const stock = getStockMeta(row.ticker);
+                  const canOpen = Boolean(stock);
+                  return (
+                    <tr
+                      key={row.ticker}
+                      className={`border-b border-slate-800/50 hover:bg-white/5 transition-colors ${canOpen ? 'cursor-pointer' : ''}`}
+                      onClick={() => {
+                        if (stock) onSelectStock(stock);
+                      }}
+                    >
+                      <td className="py-2.5 px-3"><StockLogo ticker={row.ticker} /></td>
+                      <td className="py-2.5 px-3 font-medium text-white text-sm">{row.ticker}</td>
+                      <td className="py-2.5 px-3 text-sm text-gray-400 truncate hidden sm:table-cell max-w-[10rem]" title={row.name}>
+                        {row.name}
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-sm text-gray-300 tabular-nums">
+                        ${Number(row.price ?? 0).toFixed(2)}
+                      </td>
+                      <td
+                        className={`py-2.5 px-3 text-right text-sm font-semibold tabular-nums ${
+                          (row.changePercent ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'
+                        }`}
+                      >
+                        {(row.changePercent ?? 0) >= 0 ? '+' : ''}
+                        {Number(row.changePercent ?? 0).toFixed(2)}%
+                      </td>
+                      <td className="py-2 px-2">
+                        <button
+                          type="button"
+                          className="p-1.5 rounded-md text-gray-500 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                          aria-label={`Remove ${row.ticker} from watchlist`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRemoveWatchlist?.(row.ticker);
+                          }}
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+
         <div className="flex items-center justify-between mt-2">
           <p className="text-[10px] uppercase tracking-wider text-gray-600">Live Equity Tables</p>
           <div className="flex items-center gap-3">
@@ -1776,6 +2782,7 @@ function HomeDashboard({ onSelectStock }) {
             </div>
             <table className="w-full text-left border-collapse table-fixed">
               <colgroup>
+                <col style={{ width: '32px' }} />
                 <col style={{ width: '50px' }} />
                 <col style={{ width: '88px' }} />
                 <col />
@@ -1783,6 +2790,7 @@ function HomeDashboard({ onSelectStock }) {
               </colgroup>
               <thead className="bg-[#0f1118] border-b border-slate-800">
                 <tr>
+                  <th className="py-2.5 px-1 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-center" aria-label="Watchlist" />
                   <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider" aria-label="Logo" />
                   <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Ticker</th>
                   <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Signal</th>
@@ -1796,12 +2804,30 @@ function HomeDashboard({ onSelectStock }) {
                   // Single source of truth: score from STOCK_AI_RATINGS, label/color from getSignal
                   const aiScore = STOCK_AI_RATINGS[row.ticker]?.score ?? 70;
                   const { label: sigLabel, textCls: sigText, Icon: SigIcon } = getSignal(aiScore);
+                  const watched = (watchlistTickers || []).includes(String(row.ticker || '').toUpperCase());
                   return (
                     <tr
                       key={row.ticker}
                       onClick={() => onSelectStock(row)}
                       className="border-b border-slate-800/50 hover:bg-white/5 transition-colors cursor-pointer"
                     >
+                      <td className="py-2 px-1 align-middle text-center">
+                        <button
+                          type="button"
+                          className={`inline-flex items-center justify-center p-0.5 rounded transition-colors ${
+                            watched
+                              ? 'text-amber-400 hover:text-amber-300'
+                              : 'text-slate-600 hover:text-amber-400/90'
+                          }`}
+                          aria-label={watched ? `Remove ${row.ticker} from watchlist` : `Add ${row.ticker} to watchlist`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onToggleWatchlist?.(row.ticker);
+                          }}
+                        >
+                          <Star className={`w-3.5 h-3.5 shrink-0 ${watched ? 'fill-amber-400 text-amber-400' : ''}`} />
+                        </button>
+                      </td>
                       <td className="py-2.5 px-3"><StockLogo ticker={row.ticker} /></td>
                       <td className="py-2.5 px-3 font-medium text-white text-sm">{row.ticker}</td>
                       <td className="py-2.5 px-3">
@@ -2021,6 +3047,27 @@ function AppInner() {
   const [isSearching, setIsSearching] = useState(false);
   const [searchError, setSearchError] = useState('');
   const [marketData] = useState(() => TOP_US_STOCKS ?? []);
+  const [watchlistTickers, setWatchlistTickers] = useState(() => loadWatchlistTickers());
+
+  useEffect(() => {
+    saveWatchlistTickers(watchlistTickers);
+  }, [watchlistTickers]);
+
+  const toggleWatchlistTicker = (rawTicker) => {
+    const t = String(rawTicker || '').trim().toUpperCase();
+    if (!t || !getStockMeta(t)) return;
+    setWatchlistTickers((prev) => {
+      if (prev.includes(t)) return prev.filter((x) => x !== t);
+      if (prev.length >= WATCHLIST_MAX) return prev;
+      return [...prev, t];
+    });
+  };
+
+  const removeWatchlistTicker = (rawTicker) => {
+    const t = String(rawTicker || '').trim().toUpperCase();
+    if (!t) return;
+    setWatchlistTickers((prev) => prev.filter((x) => x !== t));
+  };
 
   const popularTickers = ['AAPL', 'NVDA', 'TSLA', 'MSFT', 'GOOGL'];
   const normalizedSearch = searchInput.trim().toUpperCase();
@@ -2076,29 +3123,64 @@ function AppInner() {
   }
 
   const navTitle =
-    currentView === 'home'
-      ? 'Global Market Predictor'
-      : currentView === 'detail'
+    currentView === 'detail'
       ? (selectedStock ? `${selectedStock.ticker} — Detail` : 'Stock Detail')
-      : 'Market Analysis';
+      : 'Global Market Predictor';
 
   return (
     <div className="min-h-screen bg-[#0B0E14] text-gray-100 font-sans">
       <div className="w-full flex flex-col min-h-screen min-w-0">
         {/* Top Navbar */}
-        <div className="h-16 border-b border-gray-800 flex items-center px-6 justify-between sticky top-0 bg-[#0B0E14] z-10">
-          <div className="flex items-center gap-3">
-            {currentView !== 'home' && (
-              <button
-                onClick={handleBack}
-                className="text-gray-400 hover:text-white flex items-center gap-1 text-sm transition-colors mr-1"
-              >
-                <ArrowLeft className="w-4 h-4" /> Back
-              </button>
+        <div className="min-h-16 border-b border-gray-800 flex flex-wrap items-center px-4 sm:px-6 py-2 gap-y-2 justify-between sticky top-0 bg-[#0B0E14] z-10">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0 flex-1">
+            {currentView === 'detail' ? (
+              <>
+                <button
+                  type="button"
+                  onClick={handleBack}
+                  className="text-gray-400 hover:text-white flex items-center gap-1 text-sm transition-colors shrink-0"
+                >
+                  <ArrowLeft className="w-4 h-4" /> Back
+                </button>
+                <h1 className="text-base sm:text-lg font-semibold text-gray-200 truncate">{navTitle}</h1>
+              </>
+            ) : (
+              <>
+                <h1 className="text-base sm:text-lg font-semibold text-gray-200 truncate shrink-0">Global Market Predictor</h1>
+                <nav className="flex items-center gap-1 ml-1 sm:ml-2 pl-2 sm:pl-3 border-l border-gray-800 shrink-0" aria-label="Primary navigation">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchError('');
+                      setCurrentView('home');
+                    }}
+                    className={`px-2.5 sm:px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                      currentView === 'home'
+                        ? 'bg-slate-800 text-white'
+                        : 'text-gray-400 hover:text-white hover:bg-slate-800/50'
+                    }`}
+                  >
+                    Home
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchError('');
+                      setCurrentView('signal-portfolio');
+                    }}
+                    className={`px-2.5 sm:px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
+                      currentView === 'signal-portfolio'
+                        ? 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
+                        : 'text-gray-400 hover:text-white hover:bg-slate-800/50 border border-transparent'
+                    }`}
+                  >
+                    Signal portfolio
+                  </button>
+                </nav>
+              </>
             )}
-            <h1 className="text-lg font-semibold text-gray-200">{navTitle}</h1>
           </div>
-          <div className="relative w-72">
+          <div className="relative w-full sm:w-72 max-w-md sm:max-w-none">
             <input
               type="text"
               placeholder="SEARCH STOCK"
@@ -2146,7 +3228,17 @@ function AppInner() {
           )}
           {currentView === 'home' && (
             <div key="home" className="animate-fadeIn">
-              <HomeDashboard onSelectStock={handleSelectStock} />
+              <HomeDashboard
+                onSelectStock={handleSelectStock}
+                watchlistTickers={watchlistTickers}
+                onRemoveWatchlist={removeWatchlistTicker}
+                onToggleWatchlist={toggleWatchlistTicker}
+              />
+            </div>
+          )}
+          {currentView === 'signal-portfolio' && (
+            <div key="signal-portfolio" className="animate-fadeIn">
+              <SignalDemoPortfolioPage onSelectStock={handleSelectStock} />
             </div>
           )}
           {currentView === 'detail' && selectedStock && (
@@ -2155,6 +3247,8 @@ function AppInner() {
               stock={selectedStock}
               onBack={handleBack}
               onInitialSyncComplete={() => setIsSearching(false)}
+              isInWatchlist={watchlistTickers.includes(String(selectedStock.ticker || '').toUpperCase())}
+              onToggleWatchlist={toggleWatchlistTicker}
             />
           )}
           {currentView === 'stock' && activeStock && (

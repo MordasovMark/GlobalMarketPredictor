@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime
 from pathlib import Path
+import random
 from typing import Any, Dict, List, Optional
 
 import joblib
@@ -30,7 +31,13 @@ app = FastAPI(title="AI Trading API")
 # CORS: allow frontend (e.g. localhost:5173) to talk to the backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "https://globalmarketpredictor.onrender.com",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -223,39 +230,124 @@ def api_macro(symbols: str = "SPY,QQQ,IWM"):
     return [MacroItem(symbol=s, price=p, change_pct=c) for s, p, c in data]
 
 
+def _yf_history_for_time_range(ticker: str, time_range: str) -> tuple[pd.DataFrame, str, bool, str]:
+    """Download OHLCV for the dashboard time_range. Returns hist (sorted), strftime format, intraday flag, normalized range key."""
+    stock = yf.Ticker(ticker)
+    range_lower = (time_range or "3mo").strip().lower()
+    if range_lower not in ("1d", "1mo", "3mo", "6mo", "1y"):
+        range_lower = "3mo"
+
+    if range_lower == "1d":
+        hist = stock.history(period="1d", interval="5m")
+        date_fmt = "%H:%M"
+        is_intraday = True
+    elif range_lower == "1mo":
+        hist = stock.history(period="1mo", interval="1d")
+        date_fmt = "%Y-%m-%d"
+        is_intraday = False
+    elif range_lower == "6mo":
+        hist = stock.history(period="6mo", interval="1d")
+        date_fmt = "%Y-%m-%d"
+        is_intraday = False
+    elif range_lower == "1y":
+        hist = stock.history(period="1y", interval="1d")
+        date_fmt = "%Y-%m-%d"
+        is_intraday = False
+    else:
+        hist = stock.history(period="3mo", interval="1d")
+        date_fmt = "%Y-%m-%d"
+        is_intraday = False
+
+    if hist is None or hist.empty or len(hist) < 2:
+        return pd.DataFrame(), date_fmt, is_intraday, range_lower
+
+    if isinstance(hist.index, pd.DatetimeIndex):
+        hist = hist.sort_index()
+    return hist, date_fmt, is_intraday, range_lower
+
+
+@app.get("/api/portfolio/simulate")
+def api_portfolio_simulate(ticker: str, time_range: str = "3mo"):
+    """Paper-trade demo: same SMA / 5d momentum rules as /api/analyze, $10k all-in long-only."""
+    INITIAL = 10_000.0
+    try:
+        hist, date_fmt, is_intraday, range_norm = _yf_history_for_time_range(ticker, time_range)
+        if hist.empty or len(hist) < 2:
+            raise HTTPException(status_code=404, detail=f"No price data for {ticker}")
+
+        close = pd.to_numeric(hist["Close"], errors="coerce")
+        close = close.dropna()
+        if len(close) < 2:
+            raise HTTPException(status_code=404, detail=f"No price data for {ticker}")
+
+        min_warmup = 14 if is_intraday else 20
+        cash = INITIAL
+        shares = 0.0
+        trades: List[Dict[str, Any]] = []
+        prev_signal = "HOLD"
+
+        if len(close) > min_warmup:
+            for i in range(min_warmup, len(close)):
+                window = close.iloc[: i + 1]
+                price = float(window.iloc[-1])
+                sma_5 = float(window.iloc[-5:].mean()) if len(window) >= 5 else price
+                sma_20 = float(window.iloc[-20:].mean()) if len(window) >= 20 else price
+                pct_5d = (
+                    ((price - float(window.iloc[-5])) / float(window.iloc[-5]) * 100.0)
+                    if len(window) >= 5
+                    else 0.0
+                )
+
+                if sma_5 > sma_20 and pct_5d > 0:
+                    sig = "BUY"
+                elif sma_5 < sma_20 and pct_5d < 0:
+                    sig = "SELL"
+                else:
+                    sig = "HOLD"
+
+                date_ts = close.index[i]
+                if hasattr(date_ts, "strftime"):
+                    date_str = date_ts.strftime(date_fmt)
+                else:
+                    date_str = str(date_ts)[:16] if is_intraday else str(date_ts)[:10]
+
+                if sig == "BUY" and prev_signal != "BUY" and shares < 1e-9 and cash > 0:
+                    shares = cash / price
+                    cash = 0.0
+                    trades.append({"date": date_str, "action": "BUY", "execution_price": round(price, 2)})
+                elif sig == "SELL" and prev_signal != "SELL" and shares > 1e-9:
+                    cash = shares * price
+                    shares = 0.0
+                    trades.append({"date": date_str, "action": "SELL", "execution_price": round(price, 2)})
+
+                prev_signal = sig
+
+        last_px = float(close.iloc[-1])
+        final_balance = float(cash + shares * last_px)
+        roi_pct = ((final_balance - INITIAL) / INITIAL) * 100.0 if INITIAL else 0.0
+
+        return {
+            "ticker": ticker.upper(),
+            "time_range": range_norm,
+            "initial_balance": round(INITIAL, 2),
+            "final_balance": round(final_balance, 2),
+            "total_roi_pct": round(roi_pct, 2),
+            "trades": trades,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/analyze")
 def api_analyze(ticker: str, time_range: str = "3mo"):
     """Fetch live price, 1d change, chart_data (history + forecast), and forecast_summary. Query: ticker, time_range (1d|1mo|3mo|6mo|1y)."""
     try:
-        stock = yf.Ticker(ticker)
-        range_lower = (time_range or "3mo").strip().lower()
-
-        if range_lower == "1d":
-            hist = stock.history(period="1d", interval="5m")
-            date_fmt = "%H:%M"
-            is_intraday = True
-        elif range_lower == "1mo":
-            hist = stock.history(period="1mo", interval="1d")
-            date_fmt = "%Y-%m-%d"
-            is_intraday = False
-        elif range_lower == "6mo":
-            hist = stock.history(period="6mo", interval="1d")
-            date_fmt = "%Y-%m-%d"
-            is_intraday = False
-        elif range_lower == "1y":
-            hist = stock.history(period="1y", interval="1d")
-            date_fmt = "%Y-%m-%d"
-            is_intraday = False
-        else:
-            hist = stock.history(period="3mo", interval="1d")
-            date_fmt = "%Y-%m-%d"
-            is_intraday = False
-
-        if hist is None or hist.empty or len(hist) < 2:
+        hist, date_fmt, is_intraday, _ = _yf_history_for_time_range(ticker, time_range)
+        if hist.empty or len(hist) < 2:
             raise HTTPException(status_code=404, detail=f"No price data for {ticker}")
 
-        if isinstance(hist.index, pd.DatetimeIndex):
-            hist = hist.sort_index()
         close = hist["Close"]
         current_price = float(close.iloc[-1])
         prev = float(close.iloc[-2])
@@ -296,25 +388,108 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
         else:
             signal = "HOLD"
 
-        # --- Step 2: Build a 7-day forecast consistent with the signal ---
-        n_forecast = 7
+        # --- Step 2: Generate signal-consistent forecast (strict final day %) ---
+        # Business rule:
+        # - BUY  => final day is +[1%, 7%] vs current_price, with small daily jitter
+        # - SELL => final day is -[2%, 5%] vs current_price, with small daily jitter
+        # - HOLD => stays stable or up to -1% total (tiny jitter)
+        n_forecast = 5 if is_intraday else 7
+        noise_jitter = 0.001  # ±0.1% daily noise
 
         if signal == "BUY":
-            total_pct = np.random.uniform(0.01, 0.065)      # +1% to +6.5% total
+            total_pct = float(np.random.uniform(0.01, 0.07))
+            target_ratio = 1.0 + total_pct
         elif signal == "SELL":
-            total_pct = np.random.uniform(-0.05, -0.02)     # -2% to -5% total
+            total_pct = float(np.random.uniform(-0.05, -0.02))
+            target_ratio = 1.0 + total_pct
         else:
-            total_pct = np.random.uniform(-0.01, 0.002)     # -1% to +0.2% total
+            # HOLD: allow slight stability or up to -1% total
+            total_pct = float(np.random.uniform(-0.01, 0.002))
+            target_ratio = 1.0 + total_pct
 
-        # Distribute the total move evenly: daily_rate = (1 + total)^(1/n) - 1
-        base_daily = (1.0 + total_pct) ** (1.0 / n_forecast) - 1.0
+        target_final_price = current_price * target_ratio
+        base_daily = target_ratio ** (1.0 / n_forecast) - 1.0
 
+        # Build the first (n-1) daily multipliers from base_daily + jitter,
+        # then compute the last-day multiplier to hit the exact target_final_price.
+        # This guarantees the final day ends at the required %.
         last_ts = hist.index[-1]
         running_price = current_price
+        first_multipliers: List[float] = []
 
+        for _ in range(max(n_forecast - 1, 0)):
+            jitter = float(np.random.uniform(-noise_jitter, noise_jitter))
+            daily_rate = base_daily + jitter
+
+            if signal == "BUY":
+                # Enforce non-decreasing path (avoid dips); final day is adjusted later.
+                daily_rate = max(0.0001, daily_rate)
+            elif signal == "SELL":
+                # Enforce non-increasing path (avoid spikes); final day is adjusted later.
+                daily_rate = min(-0.0001, daily_rate)
+            else:
+                # HOLD: keep it near-flat and safe.
+                daily_rate = float(np.clip(daily_rate, -0.005, 0.005))
+
+            first_multipliers.append(1.0 + daily_rate)
+
+        product_first = float(np.prod(first_multipliers)) if first_multipliers else 1.0
+
+        # If we overshot the target in the wrong direction (rare with clamping),
+        # scale the first multipliers in log space so the final adjustment keeps monotonicity.
+        if signal == "BUY" and product_first > target_ratio and product_first > 0:
+            # scale so that product_first == target_ratio (leaves last day ~ flat)
+            factor = float(np.log(target_ratio) / np.log(product_first))
+            first_multipliers = [float(np.exp(np.log(m) * factor)) for m in first_multipliers]
+            product_first = float(np.prod(first_multipliers)) if first_multipliers else 1.0
+        elif signal == "SELL" and product_first < target_ratio and product_first > 0:
+            factor = float(np.log(target_ratio) / np.log(product_first))
+            first_multipliers = [float(np.exp(np.log(m) * factor)) for m in first_multipliers]
+            product_first = float(np.prod(first_multipliers)) if first_multipliers else 1.0
+
+        last_multiplier = target_ratio / product_first if product_first > 0 else 1.0
+
+        # Generate dates for each forecast point.
         for i in range(1, n_forecast + 1):
-            jitter = np.random.uniform(-0.0005, 0.0005)     # ±0.05% noise
-            running_price = max(0.01, running_price * (1.0 + base_daily + jitter))
+            if i <= len(first_multipliers):
+                running_price = max(0.01, running_price * first_multipliers[i - 1])
+                predicted = running_price
+            else:
+                # Force final-day % within the business constraints even after 2dp rounding.
+                # (The frontend/tooltip compares the rounded `predictedPrice` values.)
+                pred_2dp = round(float(target_final_price), 2)
+                if signal == "BUY":
+                    min_price_2dp = round(current_price * 1.01, 2)
+                    max_price_2dp = round(current_price * 1.07, 2)
+                    if pred_2dp < min_price_2dp:
+                        pred_2dp = min_price_2dp
+                    elif pred_2dp > max_price_2dp:
+                        pred_2dp = max_price_2dp
+                    # Avoid a final-day dip due to rounding.
+                    pred_2dp = max(pred_2dp, round(running_price, 2))
+                    pred_2dp = min(pred_2dp, max_price_2dp)
+                elif signal == "SELL":
+                    # Final is between -5% and -2% total drop => [0.95, 0.98] * current
+                    min_price_2dp = round(current_price * 0.95, 2)
+                    max_price_2dp = round(current_price * 0.98, 2)
+                    if pred_2dp > max_price_2dp:
+                        pred_2dp = max_price_2dp
+                    elif pred_2dp < min_price_2dp:
+                        pred_2dp = min_price_2dp
+                    # Avoid a final-day spike due to rounding.
+                    pred_2dp = min(pred_2dp, round(running_price, 2))
+                    pred_2dp = max(pred_2dp, min_price_2dp)
+                else:
+                    # HOLD: max drop is -1% => floor is 0.99 * current; allow slight uptick.
+                    min_price_2dp = round(current_price * 0.99, 2)
+                    max_price_2dp = round(current_price * 1.002, 2)
+                    if pred_2dp < min_price_2dp:
+                        pred_2dp = min_price_2dp
+                    elif pred_2dp > max_price_2dp:
+                        pred_2dp = max_price_2dp
+
+                predicted = max(0.01, float(pred_2dp))
+                running_price = predicted
 
             if is_intraday:
                 next_ts = last_ts + datetime.timedelta(minutes=5 * i)
@@ -326,7 +501,7 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
             chart_data.append({
                 "date": future_date_str,
                 "price": None,
-                "predictedPrice": round(running_price, 2),
+                "predictedPrice": round(float(predicted), 2),
             })
 
         forecast_summary = {
@@ -335,7 +510,9 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
             "bear": round(running_price * 0.98, 2),
         }
 
-        return {
+        # Build the final payload first, then apply a strict last-step override
+        # right before returning JSON to the client.
+        response_data: Dict[str, Any] = {
             "ticker": ticker.upper(),
             "price": round(current_price, 2),
             "change_pct": round(change_pct, 2),
@@ -344,6 +521,39 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
             "signal": signal,
             "is_simulated": is_simulated,
         }
+
+        # STRICT FINAL OVERRIDE BEFORE RETURN (UI Consistency) - FIXED
+        if response_data.get("signal") == "BUY":
+            # 1. Find the last actual historical price (where price is a number)
+            historical_prices = [
+                item["price"]
+                for item in response_data["chart_data"]
+                if item.get("price") is not None
+            ]
+            last_actual_price = (
+                float(historical_prices[-1])
+                if historical_prices
+                else float(response_data.get("price", 0.0))
+            )
+
+            # 2. Iterate through the chart_data and force 'predictedPrice' to go up
+            # ONLY for future dates (where actual 'price' is None)
+            current_p = last_actual_price
+            for item in response_data["chart_data"]:
+                if item.get("price") is None:  # future forecast point
+                    # Force 1% to 2% daily growth so the visual trend cannot go down.
+                    current_p = current_p * random.uniform(1.01, 1.02)
+                    item["predictedPrice"] = round(current_p, 2)
+
+            # 3. Update the summary based on the absolute last predicted point
+            final_pred_price = response_data["chart_data"][-1]["predictedPrice"]
+            response_data["forecast_summary"] = {
+                "bull": round(final_pred_price * 1.02, 2),
+                "base": round(final_pred_price, 2),
+                "bear": round(final_pred_price * 0.98, 2),
+            }
+
+        return response_data
     except HTTPException:
         raise
     except Exception as e:

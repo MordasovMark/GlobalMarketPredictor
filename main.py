@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from transformers import Pipeline, pipeline
+from api import app as ai_api_app
 
 
 LOGGER_NAME = "api"
@@ -69,11 +70,21 @@ app = FastAPI(title="Global Market Predictor API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+        "https://globalmarketpredictor.onrender.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Make sure `/api/analyze` (implemented in `api.py`) is reachable when running
+# `uvicorn main:app` locally.
+app.mount("", ai_api_app)
 
 
 class MarketDataInput(BaseModel):
@@ -309,9 +320,9 @@ def _score_sentiment_and_risk(news_df: pd.DataFrame) -> Dict[str, float]:
     risk_scores = full_text.apply(_geopolitical_risk_score).astype(float)
     avg_risk = float(risk_scores.mean()) if len(risk_scores) else 0.0
 
-    pipe = _get_sentiment_pipeline()
     titles = news_df["title"].astype(str).fillna("").tolist()
     try:
+        pipe = _get_sentiment_pipeline()
         results = pipe(titles)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Sentiment inference failed; using neutral. Error: %s", exc)
