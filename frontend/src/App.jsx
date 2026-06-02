@@ -66,7 +66,7 @@ const API_BASE_URL = resolveApiBaseUrl().replace(/\/$/, '');
 const LIVE_POLL_MS = 60 * 1000;
 const WATCHLIST_STORAGE_KEY = 'globalMarketPredictor_watchlist_v1';
 const WATCHLIST_MAX = 30;
-const DETAIL_CHART_MAX_POINTS = 180;
+const DETAIL_CHART_MAX_POINTS = 260;
 const FORECAST_CHART_MAX_POINTS = 220;
 const MINI_CHART_POINTS = 24;
 const MINI_CHART_MARGIN = { top: 6, right: 6, left: 6, bottom: 6 };
@@ -122,6 +122,76 @@ function saveWatchlistTickers(tickers) {
 }
 const FINNHUB_QUOTE_URL = (ticker) =>
   `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_API_TOKEN}`;
+const FINNHUB_CANDLE_URL = (ticker, resolution, from, to) =>
+  `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(ticker)}&resolution=${resolution}&from=${from}&to=${to}&token=${FINNHUB_API_TOKEN}`;
+
+function hashString(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i += 1) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function createSeededRng(seed) {
+  let t = seed >>> 0;
+  return () => {
+    t += 0x6D2B79F5;
+    let x = t;
+    x = Math.imul(x ^ (x >>> 15), x | 1);
+    x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function clampNumber(n, min, max) {
+  return Math.min(max, Math.max(min, n));
+}
+
+function normalizePricePoint(point) {
+  const price = Number(point?.price);
+  if (!Number.isFinite(price) || price <= 0) return null;
+  return {
+    date: String(point?.date ?? ''),
+    price: Number(price.toFixed(2)),
+  };
+}
+
+function getChartRangeConfig(timeRange = '3mo') {
+  const range = String(timeRange || '3mo').toLowerCase();
+  if (range === '1d') return { resolution: '5', lookbackSeconds: 24 * 60 * 60, points: 78, intraday: true };
+  if (range === '1mo') return { resolution: 'D', lookbackSeconds: 45 * 24 * 60 * 60, points: 22, intraday: false };
+  if (range === '6mo') return { resolution: 'D', lookbackSeconds: 210 * 24 * 60 * 60, points: 126, intraday: false };
+  if (range === '1y') return { resolution: 'D', lookbackSeconds: 400 * 24 * 60 * 60, points: 252, intraday: false };
+  return { resolution: 'D', lookbackSeconds: 110 * 24 * 60 * 60, points: 64, intraday: false };
+}
+
+function formatChartDate(ts, intraday) {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '';
+  if (intraday) {
+    return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: false });
+  }
+  return d.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric' });
+}
+
+async function fetchFinnhubCandles(ticker, timeRange) {
+  if (!FINNHUB_API_TOKEN) return [];
+  const cfg = getChartRangeConfig(timeRange);
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - cfg.lookbackSeconds;
+  const res = await fetch(FINNHUB_CANDLE_URL(ticker, cfg.resolution, from, to));
+  if (!res.ok) return [];
+  const json = await res.json();
+  if (json?.s !== 'ok' || !Array.isArray(json?.t) || !Array.isArray(json?.c)) return [];
+  return json.t
+    .map((seconds, idx) => normalizePricePoint({
+      date: formatChartDate(Number(seconds) * 1000, cfg.intraday),
+      price: json.c[idx],
+    }))
+    .filter(Boolean);
+}
 
 async function fetchLiveQuote(ticker) {
   try {
@@ -870,25 +940,61 @@ function StockLogo({ ticker, size = 'sm' }) {
   );
 }
 
-// 30 realistic mock candles seeded from the ticker so they never flicker on re-render.
-// Used whenever the live Finnhub candle call fails (rate limit, market closed, etc.).
-function generateFallbackCandles(stock, points = 30) {
-  const seed = stock.ticker.split('').reduce((a, c) => a * 31 + c.charCodeAt(0), 1);
-  const rng = (i) => Math.abs(Math.sin(seed * 0.0013 + i * 1.618033));
-  const base = stock.price ?? 100;
-  const bias = (stock.changePercent ?? 0) / 100;
-  const floor = (stock.low52 ?? base * 0.7) * 0.92;
-  const fmt = new Intl.DateTimeFormat('en-US', { month: 'numeric', day: 'numeric' });
+// Last-resort deterministic candles. The path is a bounded random walk anchored
+// to the current quote instead of a decorative repeating wave.
+function generateFallbackCandles(stock, timeRange = '3mo') {
+  const cfg = getChartRangeConfig(timeRange);
+  const points = cfg.points;
+  const rng = createSeededRng(hashString(`${stock.ticker}-${timeRange}`));
+  const endPrice = Math.max(0.01, Number(stock.price) || 100);
+  const dayChange = clampNumber((Number(stock.changePercent) || 0) / 100, -0.25, 0.25);
+  const floor = Math.max(0.01, Number(stock.low52) || endPrice * 0.55) * 0.9;
+  const ceiling = Math.max(endPrice * 1.15, Number(stock.high52) || endPrice * 1.45) * 1.08;
+  const rangeVol = Number.isFinite(Number(stock.high52)) && Number.isFinite(Number(stock.low52))
+    ? (Number(stock.high52) - Number(stock.low52)) / Math.max(endPrice, (Number(stock.high52) + Number(stock.low52)) / 2)
+    : 0.32;
+  const dailyVol = clampNumber(rangeVol / Math.sqrt(252), 0.008, 0.035);
+  const stepVol = cfg.intraday ? dailyVol / Math.sqrt(points) : dailyVol;
+  const prices = Array(points).fill(endPrice);
+
+  if (points >= 2) {
+    prices[points - 2] = clampNumber(endPrice / Math.max(0.01, 1 + dayChange), floor, ceiling);
+  }
+
+  for (let i = points - 3; i >= 0; i -= 1) {
+    const shock = ((rng() + rng() + rng()) / 3 - 0.5) * 2;
+    const drift = cfg.intraday ? dayChange / Math.max(points - 1, 1) : (dayChange / 12);
+    const nextReturn = clampNumber(drift + shock * stepVol, -stepVol * 2.8, stepVol * 2.8);
+    prices[i] = clampNumber(prices[i + 1] / (1 + nextReturn), floor, ceiling);
+  }
+
   const now = Date.now();
-  return Array.from({ length: points }, (_, i) => {
-    const t = i / (points - 1);
-    const trend = base * (1 - bias * (1 - t));
-    const wave   = base * (rng(i)       - 0.5) * 0.055;
-    const smooth = base * (rng(i * 0.4) - 0.5) * 0.022;
-    const value  = Math.max(floor, +(trend + wave + smooth).toFixed(2));
-    const d = new Date(now - (points - 1 - i) * 24 * 60 * 60 * 1000);
-    return { date: fmt.format(d), value };
-  });
+  const pointsOut = [];
+  if (cfg.intraday) {
+    const intervalMs = 5 * 60 * 1000;
+    for (let i = 0; i < points; i += 1) {
+      pointsOut.push({
+        date: formatChartDate(now - (points - 1 - i) * intervalMs, true),
+        value: Number(prices[i].toFixed(2)),
+      });
+    }
+    return pointsOut;
+  }
+
+  const cursor = new Date(now);
+  cursor.setHours(12, 0, 0, 0);
+  while (pointsOut.length < points) {
+    const day = cursor.getDay();
+    if (day !== 0 && day !== 6) {
+      const priceIdx = points - 1 - pointsOut.length;
+      pointsOut.unshift({
+        date: formatChartDate(cursor.getTime(), false),
+        value: Number(prices[priceIdx].toFixed(2)),
+      });
+    }
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return pointsOut;
 }
 
 // Mini chart for expandable row: 150px height, gradient by gain/loss
@@ -1385,8 +1491,11 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
         if (!cancelled) {
           const raw = Array.isArray(json.chart_data) ? json.chart_data : [];
           const chartData = raw
-            .filter((d) => d != null && d.price != null)
-            .map((d) => ({ date: d.date, price: d.price }));
+            .map(normalizePricePoint)
+            .filter(Boolean);
+          if (chartData.length < 2) {
+            throw new Error('API returned too few chart points');
+          }
           setFullChartData(chartData);
           setIsFallback(false);
           setLastChartSynced(Date.now());
@@ -1394,12 +1503,33 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
       } catch (err) {
         console.error('[GlobalMarketPredictor] FastAPI chart fetch error:', err);
         if (!cancelled) {
-          setFullChartData(
-            generateFallbackCandles(stock).map((d) => ({
-              date: d.date, price: d.value,
-            })),
-          );
-          setIsFallback(true);
+          try {
+            const candleData = await fetchFinnhubCandles(stock.ticker, chartTimeRange);
+            if (cancelled) return;
+            if (candleData.length >= 2) {
+              setFullChartData(candleData);
+              setIsFallback(false);
+              setLastChartSynced(Date.now());
+            } else {
+              setFullChartData(
+                generateFallbackCandles(stock, chartTimeRange).map((d) => ({
+                  date: d.date, price: d.value,
+                })),
+              );
+              setIsFallback(true);
+              setLastChartSynced(Date.now());
+            }
+          } catch (fallbackErr) {
+            console.error('[GlobalMarketPredictor] Finnhub candle fetch error:', fallbackErr);
+            if (cancelled) return;
+            setFullChartData(
+              generateFallbackCandles(stock, chartTimeRange).map((d) => ({
+                date: d.date, price: d.value,
+              })),
+            );
+            setIsFallback(true);
+            setLastChartSynced(Date.now());
+          }
         }
       } finally {
         clearTimeout(timeoutId);
@@ -1594,7 +1724,7 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
                 />
                 <Tooltip content={renderPriceTooltip} />
                 <Area
-                  type="monotone"
+                  type="linear"
                   dataKey="price"
                   stroke={color}
                   strokeWidth={2}
