@@ -839,6 +839,42 @@ const STOCK_NEWS = {
   ],
 };
 
+const NEWS_SENTIMENT_POINTS = { good: 100, neutral: 65, bad: 35 };
+const TOP_AI_STOCK_PICK_THESES = {
+  NVDA: 'Blackwell demand and hyperscaler GPU commitments keep the AI infrastructure thesis intact despite export-control noise.',
+  MSFT: 'Azure re-acceleration and Copilot seat growth support durable enterprise AI monetization with a fortress balance sheet.',
+  META: 'AI-powered ad targeting is lifting pricing while broad Meta AI adoption adds a new engagement layer across the app family.',
+  AVGO: 'Custom AI silicon wins and VMware synergies point to expanding free cash flow as hyperscalers diversify beyond GPUs.',
+  AAPL: 'Apple Intelligence rollout and services momentum improve the upgrade-cycle setup while brand loyalty protects downside.',
+};
+
+function getNewsSentimentScore(ticker) {
+  const items = STOCK_NEWS[ticker] ?? [];
+  if (items.length === 0) return 50;
+  return items.reduce((sum, item) => sum + (NEWS_SENTIMENT_POINTS[item.sentiment] ?? 50), 0) / items.length;
+}
+
+function buildTopAiStockPickRows() {
+  return TOP_US_STOCKS.map((stock) => {
+    const rating = STOCK_AI_RATINGS[stock.ticker];
+    const aiScore = rating?.score ?? 0;
+    const signal = getSignal(aiScore);
+    const newsSentimentScore = getNewsSentimentScore(stock.ticker);
+    return {
+      ticker: stock.ticker,
+      name: stock.name,
+      aiScore,
+      signal,
+      pickScore: (aiScore * 0.82) + (newsSentimentScore * 0.18),
+      thesis: TOP_AI_STOCK_PICK_THESES[stock.ticker] ?? rating?.summary ?? '',
+    };
+  })
+    .filter((row) => row.signal?.label === 'Strong Buy' || row.signal?.label === 'Buy')
+    .sort((a, b) => (b.pickScore - a.pickScore) || (b.aiScore - a.aiScore))
+    .slice(0, 5)
+    .map((row, index) => ({ ...row, rank: index + 1 }));
+}
+
 // StockLogo: Parqet API (symbol-based); onError → slate-800 circle fallback
 // size: 'sm' (26px default), 'md' (40px), 'lg' (56px)
 function StockLogo({ ticker, size = 'sm' }) {
@@ -2449,6 +2485,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
 
   const demoPortfolioRows = useMemo(() => buildDemoPortfolioRows(liveQuotes), [liveQuotes]);
   const demoPortfolioTotals = useMemo(() => sumDemoPortfolioTotals(demoPortfolioRows), [demoPortfolioRows]);
+  const topAiStockPickRows = useMemo(() => buildTopAiStockPickRows(), []);
 
   const fearGreedTimelineData = [
     { month: 'Jan', fearGreed: 31, sp500: 4720 },
@@ -2604,6 +2641,78 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
             <h3 className="text-gray-400 text-base font-medium">IWM (Russell 2000)</h3>
             <p className="text-2xl md:text-3xl font-bold text-white mt-1.5">215.40 USD</p>
             <p className="text-green-400 text-base mt-1.5">+1.05%</p>
+          </div>
+        </div>
+
+        {/* Top AI stock picks */}
+        <div className={`${CARD_BASE} overflow-hidden w-full mt-6`}>
+          <div className="bg-[#12131a] border-b border-slate-800 px-4 py-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <TrendingUp className="w-4 h-4 text-emerald-400 shrink-0" />
+              <div>
+                <h3 className="text-sm font-semibold text-white uppercase tracking-wider">Top 5 AI Stock Picks</h3>
+                <p className="text-[10px] text-gray-500 mt-0.5">
+                  Ranked by the model signal and recent news sentiment; using mock picks until the backend supplies this list.
+                </p>
+              </div>
+            </div>
+            <div className="text-[10px] text-gray-500 uppercase tracking-wider">
+              AI score + news sentiment
+            </div>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse min-w-[760px]">
+              <thead className="bg-[#0f1118] border-b border-slate-800">
+                <tr>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Symbol</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">AI signal</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider text-right">AI score</th>
+                  <th className="py-2.5 px-3 text-[10px] font-semibold text-gray-500 uppercase tracking-wider">News &amp; Thesis</th>
+                </tr>
+              </thead>
+              <tbody>
+                {topAiStockPickRows.map((row) => {
+                  const stock = getStockMeta(row.ticker);
+                  const SigIcon = row.signal?.Icon ?? Minus;
+                  return (
+                    <tr
+                      key={row.ticker}
+                      onClick={() => stock && onSelectStock(stock)}
+                      className={`border-b border-slate-800/50 hover:bg-white/5 transition-colors ${stock ? 'cursor-pointer' : ''}`}
+                    >
+                      <td className="py-3 px-3">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <span className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-slate-800 bg-[#0f1118] px-1.5 text-[10px] font-semibold text-gray-500 tabular-nums">
+                            #{row.rank}
+                          </span>
+                          <StockLogo ticker={row.ticker} />
+                          <div className="min-w-0">
+                            <p className="font-medium text-white text-sm">{row.ticker}</p>
+                            <p className="text-[11px] text-gray-500 truncate max-w-[11rem]" title={row.name}>{row.name}</p>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="py-3 px-3">
+                        <span
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wide border ${row.signal?.bgCls ?? ''} ${row.signal?.textCls ?? 'text-gray-400'} ${row.signal?.borderCls ?? 'border-slate-700'}`}
+                          title={`Score ${row.aiScore}`}
+                        >
+                          <SigIcon className="w-3 h-3 shrink-0" />
+                          {row.signal?.label ?? '-'}
+                        </span>
+                      </td>
+                      <td className="py-3 px-3 text-right text-sm font-semibold text-white tabular-nums">
+                        {row.aiScore}
+                        <span className="text-[11px] font-normal text-gray-500">/100</span>
+                      </td>
+                      <td className="py-3 px-3 text-sm text-gray-300 leading-snug">
+                        {row.thesis}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         </div>
 
