@@ -49,7 +49,6 @@ class ErrorBoundary extends React.Component {
 const CARD_BASE = 'bg-[#12131a] border border-slate-800/80 rounded-xl';
 // Finnhub API key with hard-coded fallback so missing env does not break live data.
 const FINNHUB_API_TOKEN = (import.meta.env?.VITE_FINNHUB_KEY || 'd6r89m1r01qgdhqdj95gd6r89m1r01qgdhqdj960')?.trim?.();
-const FEAR_GREED_API_URL = 'http://127.0.0.1:5000/api/fear-greed';
 
 /** FastAPI backend base URL: local dev vs production (Render). Uses hostname so prod builds never default to localhost. */
 function resolveApiBaseUrl() {
@@ -63,6 +62,9 @@ function resolveApiBaseUrl() {
   return 'https://globalmarketpredictor.onrender.com';
 }
 const API_BASE_URL = resolveApiBaseUrl().replace(/\/$/, '');
+const DASHBOARD_API_URL = `${API_BASE_URL}/api/dashboard`;
+const BACKEND_PRICE_URL = (ticker) => `${API_BASE_URL}/api/price/${encodeURIComponent(ticker)}`;
+const BACKEND_QUOTES_URL = (tickers) => `${API_BASE_URL}/api/quotes?symbols=${encodeURIComponent(tickers.join(','))}`;
 const LIVE_POLL_MS = 60 * 1000;
 const WATCHLIST_STORAGE_KEY = 'globalMarketPredictor_watchlist_v1';
 const WATCHLIST_MAX = 30;
@@ -72,6 +74,18 @@ const MINI_CHART_POINTS = 24;
 const MINI_CHART_MARGIN = { top: 6, right: 6, left: 6, bottom: 6 };
 const DETAIL_CHART_MARGIN = { top: 8, right: 8, left: 8, bottom: 4 };
 const SMALL_MODEL_CHART_MARGIN = { top: 4, right: 4, left: 4, bottom: 0 };
+const DEFAULT_MARKET_CARDS = [
+  { symbol: 'SPY', label: 'SPY', name: 'S&P 500', price: null, change_pct: null },
+  { symbol: 'QQQ', label: 'QQQ', name: 'Nasdaq', price: null, change_pct: null },
+  { symbol: 'IWM', label: 'IWM', name: 'Russell 2000', price: null, change_pct: null },
+];
+const DEFAULT_SENTIMENT_NEWS = {
+  fearDrivers: [],
+  greedDrivers: [],
+  aiConclusion: {
+    summary: 'Live sentiment drivers are loading from the market data API.',
+  },
+};
 const DEEP_VALUE_CHART_DATA = [
   { n: 'T-4', iv: 82, p: 88 },
   { n: 'T-3', iv: 85, p: 90 },
@@ -120,12 +134,43 @@ function saveWatchlistTickers(tickers) {
     /* ignore quota / private mode */
   }
 }
+
+function clampSentimentScore(value, fallback = 50) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(100, Math.max(0, parsed));
+}
+
+function normalizeQuotePayload(data) {
+  const price = Number(data?.price);
+  const change = Number(data?.change);
+  const backendChangePct = data?.changePercent ?? data?.change_pct;
+  const changePercent = Number(backendChangePct);
+  if (!Number.isFinite(price) || price <= 0) return null;
+  return {
+    price,
+    change: Number.isFinite(change) ? change : 0,
+    changePercent: Number.isFinite(changePercent) ? changePercent : 0,
+  };
+}
+
+async function fetchBackendQuote(ticker) {
+  try {
+    const res = await fetch(BACKEND_PRICE_URL(ticker));
+    const data = await res.json();
+    if (!res.ok) return null;
+    return normalizeQuotePayload(data);
+  } catch (_) {
+    return null;
+  }
+}
+
 const FINNHUB_QUOTE_URL = (ticker) =>
   `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_API_TOKEN}`;
 const FINNHUB_CANDLE_URL = (ticker, from, to) =>
   `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(ticker)}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_API_TOKEN}`;
 
-async function fetchLiveQuote(ticker) {
+async function fetchFinnhubQuote(ticker) {
   try {
     if (!FINNHUB_API_TOKEN) {
       console.warn('[GlobalMarketPredictor] Missing VITE_FINNHUB_KEY; skipping Finnhub quote fetch.');
@@ -146,6 +191,34 @@ async function fetchLiveQuote(ticker) {
   } catch (_) {
     return null;
   }
+}
+
+async function fetchLiveQuote(ticker) {
+  return (await fetchBackendQuote(ticker)) || (await fetchFinnhubQuote(ticker));
+}
+
+async function fetchLiveQuotes(tickers) {
+  const symbols = [...new Set((tickers || []).map((t) => String(t || '').trim().toUpperCase()).filter(Boolean))];
+  if (symbols.length === 0) return {};
+  try {
+    const res = await fetch(BACKEND_QUOTES_URL(symbols));
+    const data = await res.json();
+    if (res.ok && Array.isArray(data)) {
+      return data.reduce((acc, item) => {
+        const ticker = String(item?.ticker || item?.symbol || '').toUpperCase();
+        const quote = normalizeQuotePayload(item);
+        if (ticker && quote) acc[ticker] = quote;
+        return acc;
+      }, {});
+    }
+  } catch (_) {
+    // Fall back to per-symbol quote fetches below.
+  }
+  const entries = await Promise.all(symbols.map(async (ticker) => [ticker, await fetchLiveQuote(ticker)]));
+  return entries.reduce((acc, [ticker, quote]) => {
+    if (quote) acc[ticker] = quote;
+    return acc;
+  }, {});
 }
 
 async function fetchLiveCandles(ticker) {
@@ -1839,26 +1912,33 @@ function hexToRgba(hex, alpha) {
 // Needle: pivot at arc center (50,50). rotation = (sentimentScore/100)*180 - 90 → 0=left, 50=top, 100=right.
 function SentimentGauge({ value, historical = [] }) {
   const [hoveredScore, setHoveredScore] = useState(null);
-  const displayScore = hoveredScore !== null ? hoveredScore : 22;
+  const currentScore = clampSentimentScore(value, 50);
+  const displayScore = hoveredScore !== null ? hoveredScore : currentScore;
   const rotation = (displayScore / 100) * 180 - 90;
 
   const { label: currentLabel, color: currentColor } = getSentimentDetails(displayScore);
   const { zone } = getSentimentLabelAndColor(displayScore);
   const insightText = SENTIMENT_INSIGHTS[zone] || SENTIMENT_INSIGHTS.neutral;
 
-  // Spec 2.3: exactly 3 rows — Current, 1 Week Ago, 1 Month Ago (dummy data if no API)
-  const defaultTrend = [
-    { period: 'Current', periodKey: 'Current', score: 22, value: 22, label: currentLabel },
-    { period: '1 Week Ago', periodKey: '1W', score: 28, value: 28, label: 'Fear' },
-    { period: '1 Month Ago', periodKey: '1M', score: 45, value: 45, label: 'Neutral' },
+  const expectedTrend = [
+    { period: 'Current', periodKey: 'Current', fallbackScore: currentScore },
+    { period: '1 Week Ago', periodKey: '1W', fallbackScore: currentScore },
+    { period: '1 Month Ago', periodKey: '1M', fallbackScore: currentScore },
   ];
-  const trendData = historical.length >= 3
-    ? [
-        { period: 'Current', periodKey: 'Current', score: 22, value: 22, label: currentLabel },
-        { period: '1 Week Ago', periodKey: '1W', score: historical[1]?.value ?? 28, value: historical[1]?.value ?? 28, label: getSentimentLabelAndColor(historical[1]?.value ?? 28).label },
-        { period: '1 Month Ago', periodKey: '1M', score: historical[2]?.value ?? 45, value: historical[2]?.value ?? 45, label: getSentimentLabelAndColor(historical[2]?.value ?? 45).label },
-      ]
-    : defaultTrend;
+  const trendData = expectedTrend.map((expected, idx) => {
+    const source =
+      historical.find((row) => row?.periodKey === expected.periodKey || row?.period === expected.period) ||
+      historical[idx] ||
+      {};
+    const score = clampSentimentScore(source.score ?? source.value, expected.fallbackScore);
+    return {
+      period: expected.period,
+      periodKey: expected.periodKey,
+      score,
+      value: score,
+      label: getSentimentLabelAndColor(score).label,
+    };
+  });
 
   const glowConfig = ZONE_GLOW[zone] || ZONE_GLOW.neutral;
   const glowRgba = hexToRgba(glowConfig.color, glowConfig.alpha);
@@ -2013,12 +2093,8 @@ function SignalDemoPortfolioPage({ onSelectStock }) {
     let cancelled = false;
     const tickers = DEMO_PORTFOLIO_HOLDINGS.map((h) => h.ticker);
     const poll = async () => {
-      const entries = await Promise.all(tickers.map(async (t) => [t, await fetchLiveQuote(t)]));
+      const next = await fetchLiveQuotes(tickers);
       if (cancelled) return;
-      const next = {};
-      entries.forEach(([ticker, quote]) => {
-        if (quote) next[ticker] = quote;
-      });
       if (Object.keys(next).length > 0) {
         setLiveQuotes((prev) => ({ ...prev, ...next }));
         setLastSynced(Date.now());
@@ -2341,7 +2417,11 @@ function SignalDemoPortfolioPage({ onSelectStock }) {
 }
 
 function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onToggleWatchlist }) {
-  const [sentimentValue, setSentimentValue] = useState(22);
+  const [sentimentValue, setSentimentValue] = useState(50);
+  const [sentimentHistorical, setSentimentHistorical] = useState([]);
+  const [fearGreedTimelineData, setFearGreedTimelineData] = useState([]);
+  const [sentimentNews, setSentimentNews] = useState(DEFAULT_SENTIMENT_NEWS);
+  const [marketCards, setMarketCards] = useState(DEFAULT_MARKET_CARDS);
   const [sentimentLastSynced, setSentimentLastSynced] = useState(null);
   const [liveQuotes, setLiveQuotes] = useState({});
   const [watchlistQuotes, setWatchlistQuotes] = useState({});
@@ -2349,22 +2429,38 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
   const [lastTablesSynced, setLastTablesSynced] = useState(null);
   useEffect(() => {
     let cancelled = false;
-    const fetchFearGreed = async () => {
+    const fetchDashboard = async () => {
       try {
-        const res = await fetch(FEAR_GREED_API_URL);
+        const res = await fetch(DASHBOARD_API_URL);
         const data = await res.json();
         if (!res.ok || cancelled) return;
-        const liveValue = data?.value ?? data?.fearGreed ?? data?.score;
+        const liveValue = data?.sentiment?.value ?? data?.value ?? data?.fearGreed ?? data?.score;
         const parsed = Number(liveValue);
         if (!Number.isFinite(parsed)) return;
-        setSentimentValue(Math.min(100, Math.max(0, parsed)));
+        setSentimentValue(clampSentimentScore(parsed, 50));
+        const trend = data?.sentiment?.trend ?? data?.sentiment?.historical ?? data?.historical ?? [];
+        setSentimentHistorical(Array.isArray(trend) ? trend : []);
+        setFearGreedTimelineData(Array.isArray(data?.timeline) ? data.timeline : []);
+        setSentimentNews({
+          fearDrivers: Array.isArray(data?.news?.fearDrivers) ? data.news.fearDrivers : [],
+          greedDrivers: Array.isArray(data?.news?.greedDrivers) ? data.news.greedDrivers : [],
+          aiConclusion: {
+            summary: data?.news?.aiConclusion?.summary || DEFAULT_SENTIMENT_NEWS.aiConclusion.summary,
+          },
+        });
+        if (Array.isArray(data?.market) && data.market.length > 0) {
+          setMarketCards(DEFAULT_MARKET_CARDS.map((fallback) => {
+            const live = data.market.find((item) => item?.symbol === fallback.symbol || item?.label === fallback.label);
+            return live ? { ...fallback, ...live } : fallback;
+          }));
+        }
         setSentimentLastSynced(Date.now());
       } catch (_) {
         // Keep latest known value; graceful fallback.
       }
     };
-    fetchFearGreed();
-    const id = setInterval(fetchFearGreed, LIVE_POLL_MS);
+    fetchDashboard();
+    const id = setInterval(fetchDashboard, LIVE_POLL_MS);
     return () => {
       cancelled = true;
       clearInterval(id);
@@ -2376,14 +2472,8 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
     const tickers = TOP_US_STOCKS.map((s) => s.ticker);
     const fetchTableQuotes = async () => {
       if (!cancelled) setIsSyncingTables(true);
-      const entries = await Promise.all(
-        tickers.map(async (ticker) => [ticker, await fetchLiveQuote(ticker)]),
-      );
+      const next = await fetchLiveQuotes(tickers);
       if (cancelled) return;
-      const next = {};
-      entries.forEach(([ticker, quote]) => {
-        if (quote) next[ticker] = quote;
-      });
       if (Object.keys(next).length > 0) {
         setLiveQuotes((prev) => ({ ...prev, ...next }));
         setLastTablesSynced(Date.now());
@@ -2406,14 +2496,8 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
         if (!cancelled) setWatchlistQuotes({});
         return;
       }
-      const entries = await Promise.all(
-        tickers.map(async (ticker) => [ticker, await fetchLiveQuote(ticker)]),
-      );
+      const next = await fetchLiveQuotes(tickers);
       if (cancelled) return;
-      const next = {};
-      entries.forEach(([ticker, quote]) => {
-        if (quote) next[ticker] = quote;
-      });
       if (Object.keys(next).length > 0) setWatchlistQuotes((prev) => ({ ...prev, ...next }));
     };
     fetchWatchlistQuotes();
@@ -2450,35 +2534,6 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
   const demoPortfolioRows = useMemo(() => buildDemoPortfolioRows(liveQuotes), [liveQuotes]);
   const demoPortfolioTotals = useMemo(() => sumDemoPortfolioTotals(demoPortfolioRows), [demoPortfolioRows]);
 
-  const fearGreedTimelineData = [
-    { month: 'Jan', fearGreed: 31, sp500: 4720 },
-    { month: 'Feb', fearGreed: 38, sp500: 4890 },
-    { month: 'Mar', fearGreed: 29, sp500: 4810 },
-    { month: 'Apr', fearGreed: 45, sp500: 5020 },
-    { month: 'May', fearGreed: 41, sp500: 4940 },
-    { month: 'Jun', fearGreed: 56, sp500: 5110 },
-    { month: 'Jul', fearGreed: 48, sp500: 4980 },
-    { month: 'Aug', fearGreed: 35, sp500: 4860 },
-    { month: 'Sep', fearGreed: 42, sp500: 4920 },
-    { month: 'Oct', fearGreed: 26, sp500: 4780 },
-    { month: 'Nov', fearGreed: 19, sp500: 4690 },
-    { month: 'Dec', fearGreed: 22, sp500: 4750 },
-  ];
-  const sentimentNews = {
-    fearDrivers: [
-      { id: 'f1', headline: 'Inflation data comes in hot, rate cut hopes fade', source: 'Reuters', time: '2h ago' },
-      { id: 'f2', headline: 'Geopolitical tensions weigh on risk appetite', source: 'Bloomberg', time: '5h ago' },
-      { id: 'f3', headline: 'Bond yields spike on Treasury supply concerns', source: 'Fed', time: '1d ago' },
-    ],
-    greedDrivers: [
-      { id: 'g1', headline: 'Tech earnings beat expectations, Nasdaq rallies', source: 'CNBC', time: '3h ago' },
-      { id: 'g2', headline: 'Strong jobs data supports soft landing hopes', source: 'BLS', time: '1d ago' },
-    ],
-    aiConclusion: {
-      summary: 'Fear dominates as inflation and rate concerns weigh on risk appetite. The index may stay in Fear until the next Fed signal.',
-    },
-  };
-
   return (
     <div className="w-full min-h-full py-6 md:py-8 box-border overflow-x-hidden" style={{ fontFamily: 'Inter, system-ui, sans-serif' }}>
       <div className="w-full px-10 flex flex-col gap-6">
@@ -2495,7 +2550,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
               </h3>
             </div>
             <div className="flex-1 flex items-center justify-center">
-              <SentimentGauge value={sentimentValue} />
+              <SentimentGauge value={sentimentValue} historical={sentimentHistorical} />
             </div>
             <div className="mt-4 pt-3 border-t border-slate-800/60">
               <LiveIndicator lastSynced={sentimentLastSynced} />
@@ -2508,45 +2563,51 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
             </h3>
             <p className="text-xs text-gray-500 mb-4 uppercase tracking-wider">Fear & Greed Index vs S&amp;P 500</p>
             <div className="w-full h-[280px] flex-shrink-0">
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={fearGreedTimelineData} margin={{ top: 8, right: 8, left: 4, bottom: 4 }}>
-                <defs>
-                  <linearGradient id="fgGradTimeline" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#eab308" stopOpacity={0.5} />
-                    <stop offset="100%" stopColor="#eab308" stopOpacity={0} />
-                  </linearGradient>
-                  <linearGradient id="spGradTimeline" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#93c5fd" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="#93c5fd" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" strokeOpacity={0.1} vertical={false} />
-                <XAxis dataKey="month" tick={{ fill: '#6b7280', fontSize: 12 }} stroke="rgba(255,255,255,0.06)" />
-                <YAxis yAxisId="left" type="number" domain={[0, 100]} padding={{ top: 20, bottom: 20 }} tick={{ fill: '#6b7280', fontSize: 12 }} stroke="rgba(255,255,255,0.06)" width={36} />
-                <YAxis yAxisId="right" type="number" orientation="right" domain={['auto', 'auto']} padding={{ top: 20, bottom: 20 }} tick={{ fill: '#6b7280', fontSize: 12 }} stroke="rgba(255,255,255,0.06)" width={44} tickFormatter={(v) => `${(v / 1000).toFixed(1)}k`} />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: 'rgba(15, 23, 42, 0.9)',
-                    border: '1px solid rgba(71, 85, 105, 0.5)',
-                    borderRadius: '12px',
-                    backdropFilter: 'blur(12px)',
-                    padding: '10px 14px',
-                  }}
-                  itemStyle={{ color: '#e2e8f0', fontSize: 12 }}
-                  formatter={(val, name) => [name === 'fearGreed' ? val : Number(val).toLocaleString(), name === 'fearGreed' ? 'Fear & Greed' : 'S&P 500']}
-                />
-                <Area yAxisId="left" type="linear" dataKey="fearGreed" fill="url(#fgGradTimeline)" stroke="#eab308" strokeWidth={1.5} name="Fear & Greed" isAnimationActive={false} />
-                <Area yAxisId="right" type="linear" dataKey="sp500" fill="url(#spGradTimeline)" stroke="#93c5fd" strokeWidth={1.5} name="S&P 500" isAnimationActive={false} />
-                <Legend
-                  align="right"
-                  verticalAlign="top"
-                  iconType="line"
-                  iconSize={8}
-                  wrapperStyle={{ paddingLeft: '12px', fontSize: '12px' }}
-                  formatter={(value) => <span className="text-gray-500">{value}</span>}
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
+            {fearGreedTimelineData.length > 0 ? (
+              <ResponsiveContainer width="100%" height="100%">
+                <ComposedChart data={fearGreedTimelineData} margin={{ top: 8, right: 8, left: 4, bottom: 4 }}>
+                  <defs>
+                    <linearGradient id="fgGradTimeline" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#eab308" stopOpacity={0.5} />
+                      <stop offset="100%" stopColor="#eab308" stopOpacity={0} />
+                    </linearGradient>
+                    <linearGradient id="spGradTimeline" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor="#93c5fd" stopOpacity={0.4} />
+                      <stop offset="100%" stopColor="#93c5fd" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" strokeOpacity={0.1} vertical={false} />
+                  <XAxis dataKey="month" tick={{ fill: '#6b7280', fontSize: 12 }} stroke="rgba(255,255,255,0.06)" />
+                  <YAxis yAxisId="left" type="number" domain={[0, 100]} padding={{ top: 20, bottom: 20 }} tick={{ fill: '#6b7280', fontSize: 12 }} stroke="rgba(255,255,255,0.06)" width={36} />
+                  <YAxis yAxisId="right" type="number" orientation="right" domain={['auto', 'auto']} padding={{ top: 20, bottom: 20 }} tick={{ fill: '#6b7280', fontSize: 12 }} stroke="rgba(255,255,255,0.06)" width={44} tickFormatter={(v) => `${(v / 1000).toFixed(1)}k`} />
+                  <Tooltip
+                    contentStyle={{
+                      backgroundColor: 'rgba(15, 23, 42, 0.9)',
+                      border: '1px solid rgba(71, 85, 105, 0.5)',
+                      borderRadius: '12px',
+                      backdropFilter: 'blur(12px)',
+                      padding: '10px 14px',
+                    }}
+                    itemStyle={{ color: '#e2e8f0', fontSize: 12 }}
+                    formatter={(val, name) => [name === 'fearGreed' ? val : Number(val).toLocaleString(), name === 'fearGreed' ? 'Fear & Greed' : 'S&P 500']}
+                  />
+                  <Area yAxisId="left" type="linear" dataKey="fearGreed" fill="url(#fgGradTimeline)" stroke="#eab308" strokeWidth={1.5} name="Fear & Greed" isAnimationActive={false} />
+                  <Area yAxisId="right" type="linear" dataKey="sp500" fill="url(#spGradTimeline)" stroke="#93c5fd" strokeWidth={1.5} name="S&P 500" isAnimationActive={false} />
+                  <Legend
+                    align="right"
+                    verticalAlign="top"
+                    iconType="line"
+                    iconSize={8}
+                    wrapperStyle={{ paddingLeft: '12px', fontSize: '12px' }}
+                    formatter={(value) => <span className="text-gray-500">{value}</span>}
+                  />
+                </ComposedChart>
+              </ResponsiveContainer>
+            ) : (
+              <div className="h-full rounded-xl border border-slate-800/70 bg-slate-950/20 flex items-center justify-center text-sm text-gray-500">
+                Loading live sentiment timeline from the API...
+              </div>
+            )}
           </div>
 
           <div className="mt-6 pt-6 border-t border-slate-800/60 flex-1">
@@ -2554,27 +2615,31 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
               <div className="rounded-lg border-l-[3px] border-red-500/30 bg-red-950/10 border border-slate-800/60 p-4">
                 <p className="text-xs font-semibold uppercase tracking-[0.15em] text-red-400/90 mb-2.5">Fear Drivers</p>
                 <ul className="space-y-3">
-                  {sentimentNews.fearDrivers.map((item) => (
+                  {sentimentNews.fearDrivers.length > 0 ? sentimentNews.fearDrivers.map((item) => (
                     <li key={item.id} className="text-sm text-gray-400 leading-snug">
                       <span className="text-gray-300">{item.headline}</span>
                       <span className="block text-xs text-gray-500 mt-1">
                         {[item.source, item.time].filter(Boolean).join(' · ')}
                       </span>
                     </li>
-                  ))}
+                  )) : (
+                    <li className="text-sm text-gray-500 leading-snug">No fear drivers returned by the API yet.</li>
+                  )}
                 </ul>
               </div>
               <div className="rounded-lg border-l-[3px] border-green-500/30 bg-green-950/10 border border-slate-800/60 p-4">
                 <p className="text-xs font-semibold uppercase tracking-[0.15em] text-green-400/90 mb-2.5">Greed Drivers</p>
                 <ul className="space-y-3">
-                  {sentimentNews.greedDrivers.map((item) => (
+                  {sentimentNews.greedDrivers.length > 0 ? sentimentNews.greedDrivers.map((item) => (
                     <li key={item.id} className="text-sm text-gray-400 leading-snug">
                       <span className="text-gray-300">{item.headline}</span>
                       <span className="block text-xs text-gray-500 mt-1">
                         {[item.source, item.time].filter(Boolean).join(' · ')}
                       </span>
                     </li>
-                  ))}
+                  )) : (
+                    <li className="text-sm text-gray-500 leading-snug">No greed drivers returned by the API yet.</li>
+                  )}
                 </ul>
               </div>
             </div>
@@ -2590,21 +2655,23 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
       </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 w-full">
-          <div className={`${CARD_BASE} p-5 flex flex-col justify-center`}>
-            <h3 className="text-gray-400 text-base font-medium">SPY (S&amp;P 500)</h3>
-            <p className="text-2xl md:text-3xl font-bold text-white mt-1.5">593.30 USD</p>
-            <p className="text-red-400 text-base mt-1.5">-0.47%</p>
-          </div>
-          <div className={`${CARD_BASE} p-5 flex flex-col justify-center`}>
-            <h3 className="text-gray-400 text-base font-medium">QQQ (Nasdaq)</h3>
-            <p className="text-2xl md:text-3xl font-bold text-white mt-1.5">498.12 USD</p>
-            <p className="text-green-400 text-base mt-1.5">+0.12%</p>
-          </div>
-          <div className={`${CARD_BASE} p-5 flex flex-col justify-center`}>
-            <h3 className="text-gray-400 text-base font-medium">IWM (Russell 2000)</h3>
-            <p className="text-2xl md:text-3xl font-bold text-white mt-1.5">215.40 USD</p>
-            <p className="text-green-400 text-base mt-1.5">+1.05%</p>
-          </div>
+          {marketCards.map((card) => {
+            const price = Number(card.price);
+            const change = Number(card.change_pct ?? card.changePercent);
+            const hasPrice = Number.isFinite(price);
+            const hasChange = Number.isFinite(change);
+            return (
+              <div key={card.symbol} className={`${CARD_BASE} p-5 flex flex-col justify-center`}>
+                <h3 className="text-gray-400 text-base font-medium">{card.label} ({card.name})</h3>
+                <p className="text-2xl md:text-3xl font-bold text-white mt-1.5">
+                  {hasPrice ? `${price.toFixed(2)} USD` : 'Loading...'}
+                </p>
+                <p className={`${hasChange && change < 0 ? 'text-red-400' : 'text-green-400'} text-base mt-1.5`}>
+                  {hasChange ? `${change >= 0 ? '+' : ''}${change.toFixed(2)}%` : '--'}
+                </p>
+              </div>
+            );
+          })}
         </div>
 
         {/* Demo portfolio */}
@@ -2807,7 +2874,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
               <tbody>
                 {[...stocksWithLive]
                   .sort((a, b) => (b.changePercent ?? 0) - (a.changePercent ?? 0))
-                  .slice(0, 10)
+                  .slice(0, 20)
                   .map((row) => (
                     <tr
                       key={row.ticker}
@@ -3091,9 +3158,6 @@ const StockAnalysisScreen = ({ stockData }) => {
 
 // --- Main App Component ---
 function AppInner() {
-  console.log('API Key Status:', !!import.meta.env?.VITE_FINNHUB_KEY);
-  console.log('Key:', import.meta.env?.VITE_FINNHUB_KEY);
-
   const [searchInput, setSearchInput]   = useState('');
   const [currentView, setCurrentView]   = useState('home');
   const [activeStock, setActiveStock]   = useState(null);

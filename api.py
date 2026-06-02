@@ -9,11 +9,14 @@ import datetime
 from pathlib import Path
 import random
 import time
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
+import feedparser
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +31,51 @@ REGRESSION_FEATURE_COLS = [
 ]
 HISTORY_CACHE_TTL_SECONDS = 120
 HISTORY_CACHE_MAX_ENTRIES = 128
+QUOTE_CACHE_TTL_SECONDS = 45
+DASHBOARD_CACHE_TTL_SECONDS = 300
+MARKET_NEWS_LOOKBACK_DAYS = 5
+MARKET_SYMBOL_META = {
+    "SPY": {"label": "SPY", "name": "S&P 500"},
+    "QQQ": {"label": "QQQ", "name": "Nasdaq"},
+    "IWM": {"label": "IWM", "name": "Russell 2000"},
+}
+FEAR_KEYWORDS = (
+    "inflation",
+    "rates",
+    "rate",
+    "yield",
+    "yields",
+    "recession",
+    "selloff",
+    "sell-off",
+    "falls",
+    "drop",
+    "drops",
+    "slump",
+    "risk",
+    "war",
+    "tariff",
+    "debt",
+    "volatility",
+)
+GREED_KEYWORDS = (
+    "rally",
+    "rallies",
+    "record",
+    "surge",
+    "surges",
+    "gain",
+    "gains",
+    "beat",
+    "beats",
+    "growth",
+    "optimism",
+    "soft landing",
+    "easing",
+    "cuts",
+    "ai",
+    "earnings",
+)
 
 app = FastAPI(title="AI Trading API")
 
@@ -48,6 +96,8 @@ app.add_middleware(
 # Load models once at startup (same structure as train_model.py output)
 _models: Optional[Dict[str, Any]] = None
 _history_cache: Dict[tuple[str, str], tuple[float, pd.DataFrame, str, bool, str]] = {}
+_quote_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_dashboard_cache: tuple[float, Dict[str, Any]] | None = None
 
 
 def _remember_history(
@@ -194,6 +244,323 @@ def _get_macro_1d(symbols: List[str]) -> List[tuple[str, float, float]]:
     return out
 
 
+def _clean_symbol(symbol: str) -> str:
+    cleaned = "".join(ch for ch in str(symbol or "").strip().upper() if ch.isalnum() or ch in ".-^=")
+    return cleaned[:24]
+
+
+def _yf_symbol(symbol: str) -> str:
+    """Yahoo uses dashes for class shares while the UI uses dots (BRK.B)."""
+    return symbol.replace(".", "-")
+
+
+def _quote_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    symbol_norm = _clean_symbol(symbol)
+    if not symbol_norm:
+        return None
+
+    now = time.monotonic()
+    cached = _quote_cache.get(symbol_norm)
+    if cached is not None and now - cached[0] < QUOTE_CACHE_TTL_SECONDS:
+        return dict(cached[1])
+
+    try:
+        ticker = yf.Ticker(_yf_symbol(symbol_norm))
+        hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            hist = yf.download(
+                _yf_symbol(symbol_norm),
+                period="5d",
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+            )
+        if hist is None or hist.empty:
+            return None
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist.columns = hist.columns.get_level_values(0).str.strip()
+        close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+        if close.empty:
+            return None
+
+        latest = float(close.iloc[-1])
+        prev = float(close.iloc[-2]) if len(close) >= 2 else latest
+        change = latest - prev
+        change_pct = (change / prev * 100.0) if prev else 0.0
+        row = {
+            "ticker": symbol_norm,
+            "price": round(latest, 2),
+            "change": round(change, 2),
+            "changePercent": round(change_pct, 2),
+            "change_pct": round(change_pct, 2),
+        }
+        _quote_cache[symbol_norm] = (now, row)
+        return dict(row)
+    except Exception:
+        return None
+
+
+def _download_close_series(symbol: str, period: str = "1y") -> pd.Series:
+    try:
+        data = yf.download(
+            symbol,
+            period=period,
+            interval="1d",
+            progress=False,
+            auto_adjust=True,
+            threads=False,
+        )
+    except Exception:
+        return pd.Series(dtype=float)
+    if data is None or data.empty:
+        return pd.Series(dtype=float)
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0).str.strip()
+    close_col = "Close" if "Close" in data.columns else data.columns[0]
+    close = pd.to_numeric(data[close_col], errors="coerce").dropna()
+    return close.sort_index()
+
+
+def _clamp_sentiment_score(value: Any, fallback: float = 50.0) -> int:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        num = fallback
+    if not np.isfinite(num):
+        num = fallback
+    return int(round(min(100.0, max(0.0, num))))
+
+
+def _score_market_sentiment(sp500: float, sma20: float, return_5d_pct: float, vix: float) -> int:
+    """Composite 0-100 sentiment from current market data when CNN data is unavailable."""
+    score = 50.0
+    if sma20 > 0:
+        score += float(np.clip(((sp500 / sma20) - 1.0) * 500.0, -25.0, 25.0))
+    score += float(np.clip(return_5d_pct * 2.5, -15.0, 15.0))
+    if vix > 0:
+        score += float(np.clip((20.0 - vix) * 1.4, -20.0, 20.0))
+    return _clamp_sentiment_score(score)
+
+
+def _build_market_sentiment_from_yfinance() -> Dict[str, Any]:
+    sp500 = _download_close_series("^GSPC", "1y")
+    vix = _download_close_series("^VIX", "1y")
+    if sp500.empty:
+        return {
+            "value": 50,
+            "source": "yfinance composite unavailable",
+            "trend": [
+                {"period": "Current", "periodKey": "Current", "score": 50, "value": 50},
+                {"period": "1 Week Ago", "periodKey": "1W", "score": 50, "value": 50},
+                {"period": "1 Month Ago", "periodKey": "1M", "score": 50, "value": 50},
+            ],
+            "timeline": [],
+        }
+
+    combined = pd.DataFrame({"sp500": sp500})
+    if not vix.empty:
+        combined["vix"] = vix.reindex(combined.index, method="ffill")
+    else:
+        combined["vix"] = 20.0
+    combined = combined.ffill().dropna()
+    if combined.empty:
+        return {
+            "value": 50,
+            "source": "yfinance composite unavailable",
+            "trend": [
+                {"period": "Current", "periodKey": "Current", "score": 50, "value": 50},
+                {"period": "1 Week Ago", "periodKey": "1W", "score": 50, "value": 50},
+                {"period": "1 Month Ago", "periodKey": "1M", "score": 50, "value": 50},
+            ],
+            "timeline": [],
+        }
+
+    combined["sma20"] = combined["sp500"].rolling(window=20, min_periods=5).mean()
+    combined["return_5d_pct"] = combined["sp500"].pct_change(5).fillna(0.0) * 100.0
+    combined["score"] = combined.apply(
+        lambda row: _score_market_sentiment(row["sp500"], row["sma20"], row["return_5d_pct"], row["vix"]),
+        axis=1,
+    )
+    latest = combined.iloc[-1]
+    value = _clamp_sentiment_score(latest["score"])
+
+    def score_as_of(days_back: int) -> int:
+        target = combined.index[-1] - datetime.timedelta(days=days_back)
+        historical = combined.loc[combined.index <= target]
+        if historical.empty:
+            historical = combined
+        return _clamp_sentiment_score(historical.iloc[-1]["score"], value)
+
+    trend = [
+        {"period": "Current", "periodKey": "Current", "score": value, "value": value},
+        {"period": "1 Week Ago", "periodKey": "1W", "score": score_as_of(7), "value": score_as_of(7)},
+        {"period": "1 Month Ago", "periodKey": "1M", "score": score_as_of(30), "value": score_as_of(30)},
+    ]
+
+    monthly = combined[["sp500", "score"]].resample("ME").last().dropna().tail(12)
+    timeline = [
+        {
+            "month": idx.strftime("%b"),
+            "fearGreed": _clamp_sentiment_score(row["score"], value),
+            "sp500": round(float(row["sp500"]), 2),
+        }
+        for idx, row in monthly.iterrows()
+    ]
+    return {
+        "value": value,
+        "source": "yfinance market composite",
+        "trend": trend,
+        "timeline": timeline,
+    }
+
+
+def _fetch_cnn_fear_greed() -> Optional[Dict[str, Any]]:
+    try:
+        response = requests.get(
+            "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+            timeout=8,
+            headers={"User-Agent": "GlobalMarketPredictor/1.0"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        current = payload.get("fear_and_greed") or {}
+        score = current.get("score", current.get("value"))
+        value = _clamp_sentiment_score(score)
+        historical_payload = payload.get("fear_and_greed_historical") or {}
+        historical_rows = historical_payload.get("data") or []
+        scores: list[tuple[datetime.datetime, int]] = []
+        for row in historical_rows:
+            raw_x = row.get("x") or row.get("date")
+            raw_y = row.get("y") if row.get("y") is not None else row.get("score")
+            try:
+                if isinstance(raw_x, (int, float)):
+                    dt = datetime.datetime.fromtimestamp(float(raw_x) / 1000.0, tz=datetime.timezone.utc)
+                else:
+                    dt = pd.to_datetime(raw_x, utc=True).to_pydatetime()
+            except Exception:
+                continue
+            scores.append((dt, _clamp_sentiment_score(raw_y, value)))
+
+        def historical_score(days_back: int) -> int:
+            if not scores:
+                return value
+            target = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days_back)
+            eligible = [item for item in scores if item[0] <= target]
+            return eligible[-1][1] if eligible else scores[0][1]
+
+        trend = [
+            {"period": "Current", "periodKey": "Current", "score": value, "value": value},
+            {"period": "1 Week Ago", "periodKey": "1W", "score": historical_score(7), "value": historical_score(7)},
+            {"period": "1 Month Ago", "periodKey": "1M", "score": historical_score(30), "value": historical_score(30)},
+        ]
+        return {
+            "value": value,
+            "rating": current.get("rating"),
+            "source": "CNN Fear & Greed Index",
+            "trend": trend,
+        }
+    except Exception:
+        return None
+
+
+def _time_ago_from_struct(published_parsed: Any) -> str:
+    if not published_parsed:
+        return ""
+    try:
+        published = datetime.datetime.fromtimestamp(time.mktime(published_parsed), tz=datetime.timezone.utc)
+    except Exception:
+        return ""
+    delta = datetime.datetime.now(datetime.timezone.utc) - published
+    if delta.days >= 1:
+        return f"{delta.days}d ago"
+    hours = int(delta.total_seconds() // 3600)
+    if hours >= 1:
+        return f"{hours}h ago"
+    minutes = max(1, int(delta.total_seconds() // 60))
+    return f"{minutes}m ago"
+
+
+def _source_from_link(link: str) -> str:
+    host = urlparse(link or "").netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if "finance.yahoo" in host:
+        return "Yahoo Finance"
+    if "reuters" in host:
+        return "Reuters"
+    if "bloomberg" in host:
+        return "Bloomberg"
+    if "cnbc" in host:
+        return "CNBC"
+    return host.split(".")[0].title() if host else "Market news"
+
+
+def _fetch_market_news_drivers(sentiment_value: int) -> Dict[str, Any]:
+    feed_urls = [
+        "https://finance.yahoo.com/rss/topstories",
+        "https://finance.yahoo.com/rss/headline?s=SPY",
+        "https://finance.yahoo.com/rss/headline?s=QQQ",
+    ]
+    seen: set[str] = set()
+    fear: list[Dict[str, str]] = []
+    greed: list[Dict[str, str]] = []
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=MARKET_NEWS_LOOKBACK_DAYS)
+
+    for feed_url in feed_urls:
+        try:
+            parsed = feedparser.parse(feed_url)
+        except Exception:
+            continue
+        for entry in getattr(parsed, "entries", []) or []:
+            title = str(getattr(entry, "title", "") or "").strip()
+            if len(title) < 8 or title in seen:
+                continue
+            published_parsed = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
+            if published_parsed:
+                try:
+                    published = datetime.datetime.fromtimestamp(time.mktime(published_parsed), tz=datetime.timezone.utc)
+                    if published < cutoff:
+                        continue
+                except Exception:
+                    pass
+            seen.add(title)
+            lower = title.lower()
+            item = {
+                "id": f"news-{len(seen)}",
+                "headline": title,
+                "source": _source_from_link(str(getattr(entry, "link", "") or "")),
+                "time": _time_ago_from_struct(published_parsed),
+            }
+            if any(keyword in lower for keyword in FEAR_KEYWORDS):
+                fear.append(item)
+            elif any(keyword in lower for keyword in GREED_KEYWORDS):
+                greed.append(item)
+            elif sentiment_value < 45:
+                fear.append(item)
+            elif sentiment_value > 55:
+                greed.append(item)
+
+            if len(fear) >= 3 and len(greed) >= 3:
+                break
+        if len(fear) >= 3 and len(greed) >= 3:
+            break
+
+    label = "fear" if sentiment_value < 45 else "greed" if sentiment_value > 55 else "neutral"
+    if label == "fear":
+        summary = "Risk-off conditions dominate as live market data and recent headlines point to weaker risk appetite."
+    elif label == "greed":
+        summary = "Risk appetite is constructive as live market data and recent headlines show stronger demand for equities."
+    else:
+        summary = "Market sentiment is balanced as live data and recent headlines do not show a decisive fear or greed signal."
+
+    return {
+        "fearDrivers": fear[:3],
+        "greedDrivers": greed[:3],
+        "aiConclusion": {"summary": summary},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pydantic response models
 # ---------------------------------------------------------------------------
@@ -251,6 +618,74 @@ def api_macro(symbols: str = "SPY,QQQ,IWM"):
         sym_list = ["SPY", "QQQ", "IWM"]
     data = _get_macro_1d(sym_list)
     return [MacroItem(symbol=s, price=p, change_pct=c) for s, p, c in data]
+
+
+@app.get("/api/quotes")
+def api_quotes(symbols: str):
+    """Return latest quote data for a comma-separated ticker list."""
+    sym_list = [_clean_symbol(s) for s in symbols.split(",") if _clean_symbol(s)]
+    sym_list = list(dict.fromkeys(sym_list))[:50]
+    if not sym_list:
+        raise HTTPException(status_code=400, detail="At least one symbol is required.")
+    quotes = [_quote_for_symbol(symbol) for symbol in sym_list]
+    return [quote for quote in quotes if quote is not None]
+
+
+@app.get("/api/market-sentiment")
+def api_market_sentiment():
+    """Return current US market sentiment, recent trend, and timeline data."""
+    composite = _build_market_sentiment_from_yfinance()
+    cnn = _fetch_cnn_fear_greed()
+    if cnn is not None:
+        composite["value"] = cnn["value"]
+        composite["source"] = cnn.get("source", composite.get("source"))
+        composite["trend"] = cnn.get("trend") or composite.get("trend")
+        if cnn.get("rating"):
+            composite["rating"] = cnn["rating"]
+    composite["last_updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return composite
+
+
+@app.get("/api/dashboard")
+def api_dashboard():
+    """Return live dashboard data for sentiment, market cards, and news drivers."""
+    global _dashboard_cache
+    now = time.monotonic()
+    if _dashboard_cache is not None and now - _dashboard_cache[0] < DASHBOARD_CACHE_TTL_SECONDS:
+        return dict(_dashboard_cache[1])
+
+    sentiment = api_market_sentiment()
+    sentiment_value = _clamp_sentiment_score(sentiment.get("value"))
+    market_quotes = []
+    for symbol, meta in MARKET_SYMBOL_META.items():
+        quote = _quote_for_symbol(symbol)
+        if quote is None:
+            continue
+        market_quotes.append({
+            "symbol": symbol,
+            "label": meta["label"],
+            "name": meta["name"],
+            "price": quote["price"],
+            "change_pct": quote["change_pct"],
+            "changePercent": quote["changePercent"],
+        })
+
+    payload = {
+        "sentiment": {
+            "value": sentiment_value,
+            "source": sentiment.get("source"),
+            "rating": sentiment.get("rating"),
+            "trend": sentiment.get("trend") or [],
+            "historical": sentiment.get("trend") or [],
+            "last_updated": sentiment.get("last_updated"),
+        },
+        "timeline": sentiment.get("timeline") or [],
+        "market": market_quotes,
+        "news": _fetch_market_news_drivers(sentiment_value),
+        "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    _dashboard_cache = (now, payload)
+    return payload
 
 
 def _yf_history_for_time_range(ticker: str, time_range: str) -> tuple[pd.DataFrame, str, bool, str]:
@@ -597,14 +1032,14 @@ def api_analyze(ticker: str, time_range: str = "3mo"):
 @app.get("/api/price/{ticker}", response_model=PriceResponse)
 def api_price(ticker: str):
     """Return latest price and 1D % change for a ticker."""
-    df = _fetch_price_df(ticker)
-    if df.empty or len(df) < 2:
+    quote = _quote_for_symbol(ticker)
+    if quote is None:
         raise HTTPException(status_code=404, detail=f"No price data for {ticker}")
-    close = df["Close"]
-    latest = float(close.iloc[-1])
-    prev = float(close.iloc[-2])
-    change_pct = ((latest - prev) / prev * 100.0) if prev else 0.0
-    return PriceResponse(ticker=ticker.upper(), price=latest, change_pct=change_pct)
+    return PriceResponse(
+        ticker=quote["ticker"],
+        price=quote["price"],
+        change_pct=quote["change_pct"],
+    )
 
 
 @app.get("/api/forecast/{ticker}", response_model=ForecastResponse)
