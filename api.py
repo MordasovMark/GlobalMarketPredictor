@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -175,16 +176,22 @@ def _get_range_forecasts(
 
 
 def _get_macro_1d(symbols: List[str]) -> List[tuple[str, float, float]]:
-    """Fetch (symbol, price, change_pct) for each symbol."""
+    """Fetch (symbol, price, change_pct) for each symbol.
+
+    Uses the cached `_yf_history_for_time_range` helper so the response leverages
+    the in-process price cache and the Yahoo HTTP fallback when yfinance is rate-limited.
+    """
     out: List[tuple[str, float, float]] = []
     for sym in symbols:
         try:
-            t = yf.Ticker(sym)
-            hist = t.history(period="5d", interval="1d")
-            if hist is None or hist.empty or len(hist) < 2:
+            hist, _fmt, _intra, _range = _yf_history_for_time_range(sym, "1mo")
+            if hist is None or hist.empty or len(hist) < 2 or "Close" not in hist.columns:
                 out.append((sym, 0.0, 0.0))
                 continue
-            close = hist["Close"]
+            close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+            if len(close) < 2:
+                out.append((sym, 0.0, 0.0))
+                continue
             latest = float(close.iloc[-1])
             prev = float(close.iloc[-2])
             ch = ((latest - prev) / prev * 100.0) if prev else 0.0
@@ -253,11 +260,114 @@ def api_macro(symbols: str = "SPY,QQQ,IWM"):
     return [MacroItem(symbol=s, price=p, change_pct=c) for s, p, c in data]
 
 
+# Map our dashboard time_range to (yfinance period, yfinance interval, Yahoo v8 range,
+# Yahoo v8 interval, strftime fmt, intraday flag).
+_RANGE_SETTINGS: Dict[str, tuple[str, str, str, str, str, bool]] = {
+    "1d":  ("1d",  "5m", "1d",  "5m", "%H:%M",      True),
+    "1mo": ("1mo", "1d", "1mo", "1d", "%Y-%m-%d",   False),
+    "3mo": ("3mo", "1d", "3mo", "1d", "%Y-%m-%d",   False),
+    "6mo": ("6mo", "1d", "6mo", "1d", "%Y-%m-%d",   False),
+    "1y":  ("1y",  "1d", "1y",  "1d", "%Y-%m-%d",   False),
+}
+
+_YAHOO_CHART_HOSTS = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+    "https://query2.finance.yahoo.com/v8/finance/chart/{ticker}",
+)
+# Yahoo's edge rate-limits some long Chrome UA strings; the short `Mozilla/5.0`
+# and Windows Chrome UA reliably pass through. We try them in order on 429s.
+_YAHOO_USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+)
+
+
+def _fetch_yahoo_chart_http(ticker: str, range_key: str, interval: str) -> pd.DataFrame:
+    """Direct HTTP fallback to Yahoo Finance's public chart endpoint.
+
+    Used when yfinance is rate-limited or otherwise unavailable. Returns a DataFrame
+    indexed by UTC DatetimeIndex with at least a `Close` column, matching the shape
+    expected by callers of `_yf_history_for_time_range`.
+    """
+    payload: Optional[Dict[str, Any]] = None
+    for host_tpl in _YAHOO_CHART_HOSTS:
+        url = host_tpl.format(ticker=ticker)
+        for ua in _YAHOO_USER_AGENTS:
+            try:
+                resp = requests.get(
+                    url,
+                    params={"range": range_key, "interval": interval, "includePrePost": "false"},
+                    headers={"User-Agent": ua, "Accept": "application/json,text/plain,*/*"},
+                    timeout=10,
+                )
+            except Exception as e:
+                print(f"[api] Yahoo HTTP fallback request failed for {ticker} ({range_key}/{interval}) via UA={ua[:24]}: {e}")
+                continue
+            if resp.status_code == 200:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                break
+            # 429 / 5xx -> try the next UA / host combo
+        if payload is not None:
+            break
+    if payload is None:
+        return pd.DataFrame()
+
+    try:
+        result = (payload.get("chart") or {}).get("result") or []
+        if not result:
+            return pd.DataFrame()
+        item = result[0]
+        timestamps = item.get("timestamp") or []
+        quote = ((item.get("indicators") or {}).get("quote") or [{}])[0]
+        closes = quote.get("close") or []
+        opens = quote.get("open") or []
+        highs = quote.get("high") or []
+        lows = quote.get("low") or []
+        volumes = quote.get("volume") or []
+        if not timestamps or not closes or len(timestamps) != len(closes):
+            return pd.DataFrame()
+
+        rows: List[Dict[str, Any]] = []
+        for i, ts in enumerate(timestamps):
+            close_v = closes[i]
+            if close_v is None:
+                continue
+            rows.append({
+                "ts": pd.to_datetime(int(ts), unit="s", utc=True),
+                "Open":   float(opens[i])   if i < len(opens)   and opens[i]   is not None else float(close_v),
+                "High":   float(highs[i])   if i < len(highs)   and highs[i]   is not None else float(close_v),
+                "Low":    float(lows[i])    if i < len(lows)    and lows[i]    is not None else float(close_v),
+                "Close":  float(close_v),
+                "Volume": float(volumes[i]) if i < len(volumes) and volumes[i] is not None else 0.0,
+            })
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows).set_index("ts").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        return df
+    except Exception as e:
+        print(f"[api] Yahoo HTTP fallback parse failed for {ticker}: {e}")
+        return pd.DataFrame()
+
+
 def _yf_history_for_time_range(ticker: str, time_range: str) -> tuple[pd.DataFrame, str, bool, str]:
-    """Download OHLCV for the dashboard time_range. Returns hist (sorted), strftime format, intraday flag, normalized range key."""
+    """Download OHLCV for the dashboard time_range. Returns hist (sorted), strftime format, intraday flag, normalized range key.
+
+    Tries `yfinance` first; on failure, empty data, or rate-limiting it falls back to
+    a direct HTTP call against Yahoo Finance's public chart endpoint so the chart still
+    renders real prices instead of forcing the frontend into its simulated fallback.
+    """
     ticker_norm = (ticker or "").strip().upper()
     range_lower = (time_range or "3mo").strip().lower()
-    if range_lower not in ("1d", "1mo", "3mo", "6mo", "1y"):
+    if range_lower not in _RANGE_SETTINGS:
         range_lower = "3mo"
 
     cache_key = (ticker_norm, range_lower)
@@ -267,32 +377,24 @@ def _yf_history_for_time_range(ticker: str, time_range: str) -> tuple[pd.DataFra
         if time.monotonic() - cached_at < HISTORY_CACHE_TTL_SECONDS:
             return cached_hist.copy(), cached_fmt, cached_intraday, cached_range
 
-    stock = yf.Ticker(ticker_norm)
-    if range_lower == "1d":
-        hist = stock.history(period="1d", interval="5m")
-        date_fmt = "%H:%M"
-        is_intraday = True
-    elif range_lower == "1mo":
-        hist = stock.history(period="1mo", interval="1d")
-        date_fmt = "%Y-%m-%d"
-        is_intraday = False
-    elif range_lower == "6mo":
-        hist = stock.history(period="6mo", interval="1d")
-        date_fmt = "%Y-%m-%d"
-        is_intraday = False
-    elif range_lower == "1y":
-        hist = stock.history(period="1y", interval="1d")
-        date_fmt = "%Y-%m-%d"
-        is_intraday = False
-    else:
-        hist = stock.history(period="3mo", interval="1d")
-        date_fmt = "%Y-%m-%d"
-        is_intraday = False
+    yf_period, yf_interval, yahoo_range, yahoo_interval, date_fmt, is_intraday = _RANGE_SETTINGS[range_lower]
 
-    if hist is None or hist.empty or len(hist) < 2:
-        empty = pd.DataFrame()
-        _remember_history(cache_key, empty, date_fmt, is_intraday, range_lower)
-        return empty.copy(), date_fmt, is_intraday, range_lower
+    hist: pd.DataFrame = pd.DataFrame()
+    try:
+        stock = yf.Ticker(ticker_norm)
+        hist = stock.history(period=yf_period, interval=yf_interval)
+    except Exception as e:
+        print(f"[api] yfinance.history failed for {ticker_norm} ({range_lower}): {e}")
+        hist = pd.DataFrame()
+
+    if hist is None or hist.empty or len(hist) < 2 or "Close" not in getattr(hist, "columns", []):
+        fallback = _fetch_yahoo_chart_http(ticker_norm, yahoo_range, yahoo_interval)
+        if fallback is not None and not fallback.empty and len(fallback) >= 2:
+            hist = fallback
+        else:
+            empty = pd.DataFrame()
+            _remember_history(cache_key, empty, date_fmt, is_intraday, range_lower)
+            return empty.copy(), date_fmt, is_intraday, range_lower
 
     if isinstance(hist.index, pd.DatetimeIndex):
         hist = hist.sort_index()
