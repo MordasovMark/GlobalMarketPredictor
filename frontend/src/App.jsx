@@ -66,6 +66,41 @@ const API_BASE_URL = resolveApiBaseUrl().replace(/\/$/, '');
 const LIVE_POLL_MS = 60 * 1000;
 const WATCHLIST_STORAGE_KEY = 'globalMarketPredictor_watchlist_v1';
 const WATCHLIST_MAX = 30;
+const DETAIL_CHART_MAX_POINTS = 180;
+const FORECAST_CHART_MAX_POINTS = 220;
+const MINI_CHART_POINTS = 24;
+const MINI_CHART_MARGIN = { top: 6, right: 6, left: 6, bottom: 6 };
+const DETAIL_CHART_MARGIN = { top: 8, right: 8, left: 8, bottom: 4 };
+const SMALL_MODEL_CHART_MARGIN = { top: 4, right: 4, left: 4, bottom: 0 };
+const DEEP_VALUE_CHART_DATA = [
+  { n: 'T-4', iv: 82, p: 88 },
+  { n: 'T-3', iv: 85, p: 90 },
+  { n: 'T-2', iv: 88, p: 92 },
+  { n: 'T-1', iv: 90, p: 94 },
+  { n: 'T', iv: 92, p: 96 },
+];
+const SENTIMENT_FLOW_CHART_DATA = [
+  { w: 'W1', pos: 62, neg: 38 },
+  { w: 'W2', pos: 58, neg: 42 },
+  { w: 'W3', pos: 71, neg: 29 },
+  { w: 'W4', pos: 68, neg: 32 },
+];
+const MOMENTUM_CHART_DATA = [
+  { t: 'T-4', macd: 0.2, adx: 18 },
+  { t: 'T-3', macd: 0.5, adx: 22 },
+  { t: 'T-2', macd: 0.4, adx: 26 },
+  { t: 'T-1', macd: 0.7, adx: 28 },
+  { t: 'T', macd: 0.6, adx: 30 },
+];
+
+function sampleChartData(data, maxPoints) {
+  if (!Array.isArray(data)) return [];
+  const len = data.length;
+  if (len <= maxPoints || maxPoints < 2) return data;
+  const lastIndex = len - 1;
+  const step = lastIndex / (maxPoints - 1);
+  return Array.from({ length: maxPoints }, (_, i) => data[Math.round(i * step)]);
+}
 
 function loadWatchlistTickers() {
   try {
@@ -870,22 +905,24 @@ function generateFallbackCandles(stock, points = 30) {
 }
 
 // Mini chart for expandable row: 150px height, gradient by gain/loss
-function MiniStockChart({ stock }) {
+const MiniStockChart = React.memo(function MiniStockChart({ stock }) {
   const isGain = (stock.changePercent ?? 0) >= 0;
   const price = stock.price ?? 0;
-  const n = 24;
-  const chartData = Array.from({ length: n }, (_, i) => {
-    const t = i / (n - 1);
-    const drift = (stock.changePercent ?? 0) * 0.02 * (t - 0.5);
-    const noise = (Math.sin(i * 0.7) * 0.02 + Math.cos(i * 0.3) * 0.015);
-    return { day: i, value: price * (1 - 0.08 * (1 - t) + drift + noise) };
-  });
+  const chartData = useMemo(
+    () => Array.from({ length: MINI_CHART_POINTS }, (_, i) => {
+      const t = i / (MINI_CHART_POINTS - 1);
+      const drift = (stock.changePercent ?? 0) * 0.02 * (t - 0.5);
+      const noise = (Math.sin(i * 0.7) * 0.02 + Math.cos(i * 0.3) * 0.015);
+      return { day: i, value: price * (1 - 0.08 * (1 - t) + drift + noise) };
+    }),
+    [price, stock.changePercent],
+  );
   const color = isGain ? '#10b981' : '#ef4444';
   const colorMuted = isGain ? 'rgba(16,185,129,0.4)' : 'rgba(239,68,68,0.4)';
   return (
     <div className="w-full h-[150px] rounded-lg overflow-hidden bg-slate-900/50 border border-slate-800/60">
       <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={chartData} margin={{ top: 6, right: 6, left: 6, bottom: 6 }}>
+        <AreaChart data={chartData} margin={MINI_CHART_MARGIN}>
           <defs>
             <linearGradient id={`miniFill-${stock.ticker}`} x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor={color} stopOpacity={0.5} />
@@ -894,12 +931,16 @@ function MiniStockChart({ stock }) {
           </defs>
           <XAxis dataKey="day" hide />
           <YAxis domain={['auto', 'auto']} hide />
-          <Area type="monotone" dataKey="value" stroke={color} strokeWidth={1.5} fill={`url(#miniFill-${stock.ticker})`} />
+          <Area type="monotone" dataKey="value" stroke={color} strokeWidth={1.5} fill={`url(#miniFill-${stock.ticker})`} isAnimationActive={false} />
         </AreaChart>
       </ResponsiveContainer>
     </div>
   );
-}
+}, (prev, next) => (
+  prev.stock?.ticker === next.stock?.ticker
+  && prev.stock?.price === next.stock?.price
+  && prev.stock?.changePercent === next.stock?.changePercent
+));
 
 // Bloomberg-style news intelligence feed with AI sentiment badges + pulse animations
 function MarketIntelligence({ ticker }) {
@@ -1384,7 +1425,35 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
     return () => { cancelled = true; };
   }, [stock.ticker, chartTimeRange]);
 
-  const displayData = useMemo(() => fullChartData, [fullChartData]);
+  const displayData = useMemo(
+    () => sampleChartData(fullChartData, DETAIL_CHART_MAX_POINTS),
+    [fullChartData],
+  );
+  const priceTickFormatter = useCallback(
+    (v) => `$${v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(0)}`,
+    [],
+  );
+  const renderPriceTooltip = useCallback(
+    ({ active, payload, label }) => {
+      if (!active || !payload?.length) return null;
+      const hist = payload.find((p) => p.dataKey === 'price')?.value;
+      return (
+        <div style={{
+          backgroundColor: 'rgba(12,15,24,0.95)',
+          border: '1px solid rgba(71,85,105,0.5)',
+          borderRadius: '10px',
+          backdropFilter: 'blur(12px)',
+          padding: '8px 14px',
+        }}>
+          <p style={{ color: '#9ca3af', fontSize: 11, marginBottom: 4 }}>{label}</p>
+          {hist != null && (
+            <p style={{ color, fontSize: 13, fontWeight: 600 }}>{stock.ticker}: ${Number(hist).toFixed(2)}</p>
+          )}
+        </div>
+      );
+    },
+    [color, stock.ticker],
+  );
 
   return (
     <div
@@ -1516,7 +1585,7 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
           {/* ── Chart (historical) ── */}
           {displayData.length > 0 && (
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={displayData} margin={{ top: 8, right: 8, left: 8, bottom: 4 }}>
+              <AreaChart data={displayData} margin={DETAIL_CHART_MARGIN}>
                 <defs>
                   <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%"   stopColor={color} stopOpacity={0.45} />
@@ -1536,28 +1605,9 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
                   tick={{ fill: '#6b7280', fontSize: 11 }}
                   stroke="rgba(255,255,255,0.04)"
                   width={64}
-                  tickFormatter={(v) => `$${v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(0)}`}
+                  tickFormatter={priceTickFormatter}
                 />
-                <Tooltip
-                  content={({ active, payload, label }) => {
-                    if (!active || !payload?.length) return null;
-                    const hist = payload.find((p) => p.dataKey === 'price')?.value;
-                    return (
-                      <div style={{
-                        backgroundColor: 'rgba(12,15,24,0.95)',
-                        border: '1px solid rgba(71,85,105,0.5)',
-                        borderRadius: '10px',
-                        backdropFilter: 'blur(12px)',
-                        padding: '8px 14px',
-                      }}>
-                        <p style={{ color: '#9ca3af', fontSize: 11, marginBottom: 4 }}>{label}</p>
-                        {hist != null && (
-                          <p style={{ color, fontSize: 13, fontWeight: 600 }}>{stock.ticker}: ${Number(hist).toFixed(2)}</p>
-                        )}
-                      </div>
-                    );
-                  }}
-                />
+                <Tooltip content={renderPriceTooltip} />
                 <Area
                   type="monotone"
                   dataKey="price"
@@ -1567,6 +1617,7 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
                   dot={false}
                   activeDot={{ r: 4, strokeWidth: 0, fill: color }}
                   connectNulls={true}
+                  isAnimationActive={false}
                 />
               </AreaChart>
             </ResponsiveContainer>
@@ -1666,7 +1717,7 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
                 <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Intrinsic Value vs. Price (Mock)</p>
                 <div className="h-24">
                   <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={[{ n: 'T-4', iv: 82, p: 88 }, { n: 'T-3', iv: 85, p: 90 }, { n: 'T-2', iv: 88, p: 92 }, { n: 'T-1', iv: 90, p: 94 }, { n: 'T', iv: 92, p: 96 }]} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
+                    <AreaChart data={DEEP_VALUE_CHART_DATA} margin={SMALL_MODEL_CHART_MARGIN}>
                       <defs>
                         <linearGradient id={`behind-iv-${stock.ticker}`} x1="0" y1="0" x2="0" y2="1">
                           <stop offset="0%" stopColor="#10b981" stopOpacity={0.4} />
@@ -1675,8 +1726,8 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
                       </defs>
                       <XAxis dataKey="n" tick={{ fontSize: 9, fill: '#64748b' }} />
                       <YAxis hide domain={['auto', 'auto']} />
-                      <Area type="monotone" dataKey="iv" stroke="#10b981" fill={`url(#behind-iv-${stock.ticker})`} strokeWidth={1.5} />
-                      <Line type="monotone" dataKey="p" stroke="#94a3b8" strokeWidth={1} strokeDasharray="3 3" dot={false} />
+                      <Area type="monotone" dataKey="iv" stroke="#10b981" fill={`url(#behind-iv-${stock.ticker})`} strokeWidth={1.5} isAnimationActive={false} />
+                      <Line type="monotone" dataKey="p" stroke="#94a3b8" strokeWidth={1} strokeDasharray="3 3" dot={false} isAnimationActive={false} />
                     </AreaChart>
                   </ResponsiveContainer>
                 </div>
@@ -1694,11 +1745,11 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
                 <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Sentiment Score Flow (Positive/Negative Mock)</p>
                 <div className="h-24">
                   <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={[{ w: 'W1', pos: 62, neg: 38 }, { w: 'W2', pos: 58, neg: 42 }, { w: 'W3', pos: 71, neg: 29 }, { w: 'W4', pos: 68, neg: 32 }]} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
+                    <BarChart data={SENTIMENT_FLOW_CHART_DATA} margin={SMALL_MODEL_CHART_MARGIN}>
                       <XAxis dataKey="w" tick={{ fontSize: 9, fill: '#64748b' }} />
                       <YAxis hide domain={[0, 100]} />
-                      <Bar dataKey="pos" fill="#10b981" fillOpacity={0.8} radius={[2, 2, 0, 0]} />
-                      <Bar dataKey="neg" fill="#ef4444" fillOpacity={0.5} radius={[2, 2, 0, 0]} />
+                      <Bar dataKey="pos" fill="#10b981" fillOpacity={0.8} radius={[2, 2, 0, 0]} isAnimationActive={false} />
+                      <Bar dataKey="neg" fill="#ef4444" fillOpacity={0.5} radius={[2, 2, 0, 0]} isAnimationActive={false} />
                     </BarChart>
                   </ResponsiveContainer>
                 </div>
@@ -1716,11 +1767,11 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
                 <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider mb-2">Momentum Indicators (MACD/ADX Mock)</p>
                 <div className="h-24">
                   <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={[{ t: 'T-4', macd: 0.2, adx: 18 }, { t: 'T-3', macd: 0.5, adx: 22 }, { t: 'T-2', macd: 0.4, adx: 26 }, { t: 'T-1', macd: 0.7, adx: 28 }, { t: 'T', macd: 0.6, adx: 30 }]} margin={{ top: 4, right: 4, left: 4, bottom: 0 }}>
+                    <LineChart data={MOMENTUM_CHART_DATA} margin={SMALL_MODEL_CHART_MARGIN}>
                       <XAxis dataKey="t" tick={{ fontSize: 9, fill: '#64748b' }} />
                       <YAxis hide domain={['auto', 'auto']} />
-                      <Line type="monotone" dataKey="macd" stroke="#10b981" strokeWidth={2} dot={false} />
-                      <Line type="monotone" dataKey="adx" stroke="#eab308" strokeWidth={1.5} strokeDasharray="4 2" dot={false} />
+                      <Line type="monotone" dataKey="macd" stroke="#10b981" strokeWidth={2} dot={false} isAnimationActive={false} />
+                      <Line type="monotone" dataKey="adx" stroke="#eab308" strokeWidth={1.5} strokeDasharray="4 2" dot={false} isAnimationActive={false} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
@@ -2484,8 +2535,8 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
                   itemStyle={{ color: '#e2e8f0', fontSize: 12 }}
                   formatter={(val, name) => [name === 'fearGreed' ? val : Number(val).toLocaleString(), name === 'fearGreed' ? 'Fear & Greed' : 'S&P 500']}
                 />
-                <Area yAxisId="left" type="linear" dataKey="fearGreed" fill="url(#fgGradTimeline)" stroke="#eab308" strokeWidth={1.5} name="Fear & Greed" />
-                <Area yAxisId="right" type="linear" dataKey="sp500" fill="url(#spGradTimeline)" stroke="#93c5fd" strokeWidth={1.5} name="S&P 500" />
+                <Area yAxisId="left" type="linear" dataKey="fearGreed" fill="url(#fgGradTimeline)" stroke="#eab308" strokeWidth={1.5} name="Fear & Greed" isAnimationActive={false} />
+                <Area yAxisId="right" type="linear" dataKey="sp500" fill="url(#spGradTimeline)" stroke="#93c5fd" strokeWidth={1.5} name="S&P 500" isAnimationActive={false} />
                 <Legend
                   align="right"
                   verticalAlign="top"
@@ -2890,8 +2941,11 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
 }
 
 // --- Professional Forecast Chart Component ---
-const ProfessionalForecastChart = ({ data, currentPrice }) => {
-  const safeData = Array.isArray(data) ? data : [];
+const ProfessionalForecastChart = React.memo(({ data, currentPrice }) => {
+  const safeData = useMemo(
+    () => sampleChartData(data, FORECAST_CHART_MAX_POINTS),
+    [data],
+  );
   const safeCurrentPrice =
     typeof currentPrice === 'number' && Number.isFinite(currentPrice) ? currentPrice : null;
 
@@ -2940,10 +2994,10 @@ const ProfessionalForecastChart = ({ data, currentPrice }) => {
               <ReferenceLine y={safeCurrentPrice} stroke="#eab308" strokeDasharray="3 3" />
             )}
             
-            <Area type="monotone" dataKey="bull" fill="url(#colorBull)" stroke="#22c55e" strokeWidth={1} connectNulls={true} />
-            <Area type="monotone" dataKey="base" fill="url(#colorBase)" stroke="#3b82f6" strokeWidth={1} connectNulls={true} />
-            <Area type="monotone" dataKey="bear" fill="url(#colorBear)" stroke="#ef4444" strokeWidth={1} connectNulls={true} />
-            <Line type="linear" dataKey="price" stroke="#ffffff" strokeWidth={2} dot={false} connectNulls={true} />
+            <Area type="monotone" dataKey="bull" fill="url(#colorBull)" stroke="#22c55e" strokeWidth={1} connectNulls={true} isAnimationActive={false} />
+            <Area type="monotone" dataKey="base" fill="url(#colorBase)" stroke="#3b82f6" strokeWidth={1} connectNulls={true} isAnimationActive={false} />
+            <Area type="monotone" dataKey="bear" fill="url(#colorBear)" stroke="#ef4444" strokeWidth={1} connectNulls={true} isAnimationActive={false} />
+            <Line type="linear" dataKey="price" stroke="#ffffff" strokeWidth={2} dot={false} connectNulls={true} isAnimationActive={false} />
           </ComposedChart>
         </ResponsiveContainer>
       </div>
@@ -2956,7 +3010,7 @@ const ProfessionalForecastChart = ({ data, currentPrice }) => {
       </div>
     </div>
   );
-};
+});
 
 // --- Stock Analysis Screen Component ---
 const StockAnalysisScreen = ({ stockData }) => {

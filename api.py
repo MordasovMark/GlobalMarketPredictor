@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 from pathlib import Path
 import random
+import time
 from typing import Any, Dict, List, Optional
 
 import joblib
@@ -25,6 +26,8 @@ MODEL_PATH = Path("ai_range_models.pkl")
 REGRESSION_FEATURE_COLS = [
     "SMA_20", "SMA_50", "RSI", "MACD", "MACD_Signal", "Volatility", "Daily_Return"
 ]
+HISTORY_CACHE_TTL_SECONDS = 120
+HISTORY_CACHE_MAX_ENTRIES = 128
 
 app = FastAPI(title="AI Trading API")
 
@@ -44,6 +47,26 @@ app.add_middleware(
 
 # Load models once at startup (same structure as train_model.py output)
 _models: Optional[Dict[str, Any]] = None
+_history_cache: Dict[tuple[str, str], tuple[float, pd.DataFrame, str, bool, str]] = {}
+
+
+def _remember_history(
+    cache_key: tuple[str, str],
+    hist: pd.DataFrame,
+    date_fmt: str,
+    is_intraday: bool,
+    range_lower: str,
+) -> None:
+    _history_cache[cache_key] = (
+        time.monotonic(),
+        hist.copy(),
+        date_fmt,
+        is_intraday,
+        range_lower,
+    )
+    if len(_history_cache) > HISTORY_CACHE_MAX_ENTRIES:
+        oldest_key = min(_history_cache, key=lambda key: _history_cache[key][0])
+        _history_cache.pop(oldest_key, None)
 
 
 def _load_models() -> Optional[Dict[str, Any]]:
@@ -232,11 +255,19 @@ def api_macro(symbols: str = "SPY,QQQ,IWM"):
 
 def _yf_history_for_time_range(ticker: str, time_range: str) -> tuple[pd.DataFrame, str, bool, str]:
     """Download OHLCV for the dashboard time_range. Returns hist (sorted), strftime format, intraday flag, normalized range key."""
-    stock = yf.Ticker(ticker)
+    ticker_norm = (ticker or "").strip().upper()
     range_lower = (time_range or "3mo").strip().lower()
     if range_lower not in ("1d", "1mo", "3mo", "6mo", "1y"):
         range_lower = "3mo"
 
+    cache_key = (ticker_norm, range_lower)
+    cached = _history_cache.get(cache_key)
+    if cached is not None:
+        cached_at, cached_hist, cached_fmt, cached_intraday, cached_range = cached
+        if time.monotonic() - cached_at < HISTORY_CACHE_TTL_SECONDS:
+            return cached_hist.copy(), cached_fmt, cached_intraday, cached_range
+
+    stock = yf.Ticker(ticker_norm)
     if range_lower == "1d":
         hist = stock.history(period="1d", interval="5m")
         date_fmt = "%H:%M"
@@ -259,10 +290,13 @@ def _yf_history_for_time_range(ticker: str, time_range: str) -> tuple[pd.DataFra
         is_intraday = False
 
     if hist is None or hist.empty or len(hist) < 2:
-        return pd.DataFrame(), date_fmt, is_intraday, range_lower
+        empty = pd.DataFrame()
+        _remember_history(cache_key, empty, date_fmt, is_intraday, range_lower)
+        return empty.copy(), date_fmt, is_intraday, range_lower
 
     if isinstance(hist.index, pd.DatetimeIndex):
         hist = hist.sort_index()
+    _remember_history(cache_key, hist, date_fmt, is_intraday, range_lower)
     return hist, date_fmt, is_intraday, range_lower
 
 
