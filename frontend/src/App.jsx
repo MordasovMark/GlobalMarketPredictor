@@ -1447,7 +1447,7 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
 
   useEffect(() => {
     initialSyncNotifiedRef.current = false;
-  }, [stock.ticker]);
+  }, [stock.ticker, onInitialSyncComplete]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1472,7 +1472,7 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
       cancelled = true;
       clearInterval(id);
     };
-  }, [stock.ticker]);
+  }, [stock.ticker, onInitialSyncComplete]);
 
   // Fetch chart data from FastAPI (/api/analyze) — historical prices only (no forecast UI)
   useEffect(() => {
@@ -1538,7 +1538,7 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
     };
     fetchChart();
     return () => { cancelled = true; };
-  }, [stock.ticker, chartTimeRange]);
+  }, [stock, chartTimeRange]);
 
   const displayData = useMemo(
     () => sampleChartData(fullChartData, DETAIL_CHART_MAX_POINTS),
