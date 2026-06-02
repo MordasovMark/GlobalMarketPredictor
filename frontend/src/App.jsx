@@ -160,15 +160,13 @@ async function fetchBackendQuote(ticker) {
     const data = await res.json();
     if (!res.ok) return null;
     return normalizeQuotePayload(data);
-  } catch (_) {
+  } catch {
     return null;
   }
 }
 
 const FINNHUB_QUOTE_URL = (ticker) =>
   `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_API_TOKEN}`;
-const FINNHUB_CANDLE_URL = (ticker, from, to) =>
-  `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(ticker)}&resolution=D&from=${from}&to=${to}&token=${FINNHUB_API_TOKEN}`;
 
 async function fetchFinnhubQuote(ticker) {
   try {
@@ -188,7 +186,7 @@ async function fetchFinnhubQuote(ticker) {
       change: Number.isFinite(d) ? d : 0,
       changePercent: Number.isFinite(dp) ? dp : 0,
     };
-  } catch (_) {
+  } catch {
     return null;
   }
 }
@@ -211,7 +209,7 @@ async function fetchLiveQuotes(tickers) {
         return acc;
       }, {});
     }
-  } catch (_) {
+  } catch {
     // Fall back to per-symbol quote fetches below.
   }
   const entries = await Promise.all(symbols.map(async (ticker) => [ticker, await fetchLiveQuote(ticker)]));
@@ -219,34 +217,6 @@ async function fetchLiveQuotes(tickers) {
     if (quote) acc[ticker] = quote;
     return acc;
   }, {});
-}
-
-async function fetchLiveCandles(ticker) {
-  const to = Math.floor(Date.now() / 1000);
-  const from = to - (30 * 24 * 60 * 60);
-  try {
-    if (!FINNHUB_API_TOKEN) {
-      console.warn('[GlobalMarketPredictor] Missing VITE_FINNHUB_KEY; skipping Finnhub candle fetch.');
-      return null;
-    }
-    const res = await fetch(FINNHUB_CANDLE_URL(ticker, from, to));
-    const data = await res.json();
-    if (!res.ok || data?.s !== 'ok' || !Array.isArray(data?.t) || !Array.isArray(data?.c)) return null;
-    const fmt = new Intl.DateTimeFormat('en-US', { month: 'numeric', day: 'numeric', timeZone: 'UTC' });
-    const rows = data.t
-      .map((ts, idx) => {
-        const close = Number(data.c[idx]);
-        if (!Number.isFinite(close)) return null;
-        return {
-          date: fmt.format(new Date(Number(ts) * 1000)),
-          value: +close.toFixed(2),
-        };
-      })
-      .filter(Boolean);
-    return rows.length > 0 ? rows : null;
-  } catch (_) {
-    return null;
-  }
 }
 
 function formatSyncedTime(ts) {
@@ -937,25 +907,6 @@ function StockLogo({ ticker, size = 'sm' }) {
   );
 }
 
-// Deterministic chart data seeded from ticker chars so it never re-randomizes on re-render
-function generateDetailChartData(stock, points = 90) {
-  const seed = stock.ticker.split('').reduce((a, c) => a * 31 + c.charCodeAt(0), 1);
-  const rng = (i) => Math.abs(Math.sin(seed * 0.001 + i * 1.618)) ;
-  const base = stock.price;
-  const bias = (stock.changePercent ?? 0) / 100;
-  const origin = new Date(2024, 8, 15); // 90 days back approx
-  return Array.from({ length: points }, (_, i) => {
-    const t = i / (points - 1);
-    const trend = base * (1 - bias + bias * t);
-    const wave = base * (rng(i) - 0.5) * 0.06;
-    const smooth = base * (rng(i * 0.3) - 0.5) * 0.025;
-    const value = Math.max(stock.low52 * 0.9, +(trend + wave + smooth).toFixed(2));
-    const d = new Date(origin);
-    d.setDate(d.getDate() + i);
-    return { date: `${d.getMonth() + 1}/${d.getDate()}`, value };
-  });
-}
-
 // 30 realistic mock candles seeded from the ticker so they never flicker on re-render.
 // Used whenever the live Finnhub candle call fails (rate limit, market closed, etc.).
 function generateFallbackCandles(stock, points = 30) {
@@ -991,7 +942,6 @@ const MiniStockChart = React.memo(function MiniStockChart({ stock }) {
     [price, stock.changePercent],
   );
   const color = isGain ? '#10b981' : '#ef4444';
-  const colorMuted = isGain ? 'rgba(16,185,129,0.4)' : 'rgba(239,68,68,0.4)';
   return (
     <div className="w-full h-[150px] rounded-lg overflow-hidden bg-slate-900/50 border border-slate-800/60">
       <ResponsiveContainer width="100%" height="100%">
@@ -1050,7 +1000,6 @@ function MarketIntelligence({ ticker }) {
         {items.map((item, idx) => {
           const isGood    = item.sentiment === 'good';
           const isBad     = item.sentiment === 'bad';
-          const isNeutral = !isGood && !isBad;
 
           const Icon        = isGood ? TrendingUp : isBad ? TrendingDown : Minus;
           const accentColor = isGood ? '#10b981'  : isBad ? '#ef4444'    : '#475569';
@@ -1142,7 +1091,7 @@ function AIRatingGauge({ ticker, score, models = [] }) {
 
       {/* ── Model Cards ── */}
       <div className="space-y-3 flex-1">
-        {models.map((model, idx) => {
+        {models.map((model) => {
           const sig = getSignal(model.score);
           return (
             <div
@@ -1863,14 +1812,6 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
   );
 }
 
-function formatVolume(v) {
-  if (v == null || v === undefined) return '—';
-  if (v >= 1e9) return `${(v / 1e9).toFixed(1)}B`;
-  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
-  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
-  return String(v);
-}
-
 function getSentimentLabelAndColor(value) {
   const v = Math.min(100, Math.max(0, value));
   if (v <= 24) return { label: 'Extreme Fear', color: '#ef4444', zone: 'extremeFear' };
@@ -2455,7 +2396,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
           }));
         }
         setSentimentLastSynced(Date.now());
-      } catch (_) {
+      } catch {
         // Keep latest known value; graceful fallback.
       }
     };

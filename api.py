@@ -12,7 +12,6 @@ import time
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
-import feedparser
 import joblib
 import numpy as np
 import pandas as pd
@@ -21,6 +20,11 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+try:
+    import feedparser
+except ImportError:  # pragma: no cover - optional RSS enhancement
+    feedparser = None
 
 # ---------------------------------------------------------------------------
 # Config
@@ -497,6 +501,20 @@ def _source_from_link(link: str) -> str:
 
 
 def _fetch_market_news_drivers(sentiment_value: int) -> Dict[str, Any]:
+    if feedparser is None:
+        label = "fear" if sentiment_value < 45 else "greed" if sentiment_value > 55 else "neutral"
+        if label == "fear":
+            summary = "Risk-off conditions dominate as live market data points to weaker risk appetite."
+        elif label == "greed":
+            summary = "Risk appetite is constructive as live market data shows stronger demand for equities."
+        else:
+            summary = "Market sentiment is balanced as live data does not show a decisive fear or greed signal."
+        return {
+            "fearDrivers": [],
+            "greedDrivers": [],
+            "aiConclusion": {"summary": summary},
+        }
+
     feed_urls = [
         "https://finance.yahoo.com/rss/topstories",
         "https://finance.yahoo.com/rss/headline?s=SPY",
