@@ -6,11 +6,15 @@ Serves predictions from ai_range_models.pkl and live data from yfinance.
 from __future__ import annotations
 
 import datetime
+import html
 from pathlib import Path
 import random
+import re
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional
 
+import feedparser
 import joblib
 import numpy as np
 import pandas as pd
@@ -28,6 +32,33 @@ REGRESSION_FEATURE_COLS = [
 ]
 HISTORY_CACHE_TTL_SECONDS = 120
 HISTORY_CACHE_MAX_ENTRIES = 128
+NEWS_LOOKBACK_DAYS = 7
+NEWS_CACHE_TTL_SECONDS = 15 * 60
+NEWS_CACHE_MAX_ENTRIES = 128
+NEWS_SENTIMENT_POINTS = {"good": 100.0, "neutral": 65.0, "bad": 35.0}
+FINBERT_MODEL_NAME = "ProsusAI/finbert"
+NEWS_TICKER_KEYWORDS = {
+    "AAPL": ("apple", "iphone"),
+    "NVDA": ("nvidia",),
+    "MSFT": ("microsoft", "azure", "copilot"),
+    "TSLA": ("tesla",),
+    "AMZN": ("amazon", "aws"),
+    "META": ("meta", "facebook", "instagram"),
+    "GOOGL": ("google", "alphabet", "youtube"),
+    "BRK-B": ("berkshire", "buffett"),
+    "V": ("visa",),
+    "UNH": ("unitedhealth", "optum"),
+    "JPM": ("jpmorgan", "jp morgan", "dimon"),
+    "JNJ": ("johnson & johnson", "j&j"),
+    "WMT": ("walmart",),
+    "XOM": ("exxon", "exxonmobil"),
+    "MA": ("mastercard",),
+    "AVGO": ("broadcom", "vmware"),
+    "PG": ("procter", "p&g"),
+    "ORCL": ("oracle",),
+    "COST": ("costco",),
+    "HD": ("home depot",),
+}
 
 app = FastAPI(title="AI Trading API")
 
@@ -48,6 +79,8 @@ app.add_middleware(
 # Load models once at startup (same structure as train_model.py output)
 _models: Optional[Dict[str, Any]] = None
 _history_cache: Dict[tuple[str, str], tuple[float, pd.DataFrame, str, bool, str]] = {}
+_news_cache: Dict[tuple[str, int], tuple[float, Dict[str, Any]]] = {}
+_sentiment_pipeline: Optional[Any] = None
 
 
 def _remember_history(
@@ -80,6 +113,240 @@ def _load_models() -> Optional[Dict[str, Any]]:
     except Exception as e:
         print(f"Warning: Could not load ai_range_models.pkl — {e}")
     return None
+
+
+def _normalize_news_ticker(ticker: str) -> str:
+    """Normalize display tickers to symbols accepted by Yahoo/Google RSS."""
+    return (ticker or "").strip().upper().replace(".", "-")
+
+
+def _clean_news_text(value: Any) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_published(value: Any) -> Optional[pd.Timestamp]:
+    if not value:
+        return None
+    ts = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def _format_relative_time(published: Optional[pd.Timestamp]) -> str:
+    if published is None:
+        return "recent"
+    now = pd.Timestamp.now(tz="UTC")
+    delta_seconds = max(0, int((now - published).total_seconds()))
+    if delta_seconds < 3600:
+        minutes = max(1, delta_seconds // 60)
+        return f"{minutes}m ago"
+    if delta_seconds < 86_400:
+        return f"{delta_seconds // 3600}h ago"
+    return f"{delta_seconds // 86_400}d ago"
+
+
+def _entry_source_name(entry: Any, fallback: str) -> str:
+    source = getattr(entry, "source", None)
+    if isinstance(source, dict):
+        title = source.get("title")
+    else:
+        title = getattr(source, "title", None)
+    return _clean_news_text(title) or fallback
+
+
+def _parse_news_feed(url: str, fallback_source: str) -> List[Dict[str, Any]]:
+    try:
+        parsed = feedparser.parse(url)
+    except Exception:
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for entry in getattr(parsed, "entries", []) or []:
+        headline = _clean_news_text(getattr(entry, "title", ""))
+        if not headline:
+            continue
+        published_raw = (
+            getattr(entry, "published", "")
+            or getattr(entry, "updated", "")
+            or getattr(entry, "created", "")
+        )
+        published = _parse_published(published_raw)
+        records.append(
+            {
+                "headline": headline,
+                "summary": _clean_news_text(
+                    getattr(entry, "summary", "") or getattr(entry, "description", "")
+                ),
+                "source": _entry_source_name(entry, fallback_source),
+                "link": str(getattr(entry, "link", "") or ""),
+                "published_ts": published,
+            }
+        )
+    return records
+
+
+def _fetch_live_news(ticker: str) -> List[Dict[str, Any]]:
+    source_ticker = _normalize_news_ticker(ticker)
+    query = urllib.parse.quote_plus(f"{source_ticker} stock news OR {source_ticker} market analysis")
+    urls = [
+        (
+            f"https://finance.yahoo.com/rss/headline?s={urllib.parse.quote(source_ticker)}",
+            "Yahoo Finance",
+        ),
+        (
+            f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en",
+            "Google News",
+        ),
+    ]
+
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=NEWS_LOOKBACK_DAYS)
+    seen: set[str] = set()
+    items: List[Dict[str, Any]] = []
+    for url, fallback_source in urls:
+        for record in _parse_news_feed(url, fallback_source):
+            published = record.get("published_ts")
+            if published is not None and published < cutoff:
+                continue
+            if not _is_relevant_news_item(record, source_ticker):
+                continue
+            key = re.sub(r"\W+", "", str(record["headline"]).lower())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            items.append(record)
+
+    items.sort(
+        key=lambda item: item.get("published_ts") or pd.Timestamp.min.tz_localize("UTC"),
+        reverse=True,
+    )
+    return items
+
+
+def _is_relevant_news_item(item: Dict[str, Any], source_ticker: str) -> bool:
+    haystack = str(item.get("headline", "")).lower()
+    ticker_variants = {
+        source_ticker.lower(),
+        source_ticker.replace("-", ".").lower(),
+        source_ticker.replace("-", "").lower(),
+        f"${source_ticker.lower()}",
+    }
+    keywords = set(NEWS_TICKER_KEYWORDS.get(source_ticker, ()))
+    return any(token and token in haystack for token in ticker_variants | keywords)
+
+
+def _get_sentiment_pipeline() -> Any:
+    global _sentiment_pipeline
+    if _sentiment_pipeline is None:
+        from transformers import pipeline
+
+        _sentiment_pipeline = pipeline(task="sentiment-analysis", model=FINBERT_MODEL_NAME)
+    return _sentiment_pipeline
+
+
+def _fallback_sentiment(headline: str) -> tuple[str, float]:
+    text = headline.lower()
+    negative_terms = ("miss", "probe", "cut", "falls", "risk", "warning", "lawsuit", "slump")
+    positive_terms = ("beat", "surge", "growth", "raises", "record", "upgrade", "accelerates")
+    if any(term in text for term in negative_terms):
+        return "negative", 0.55
+    if any(term in text for term in positive_terms):
+        return "positive", 0.55
+    return "neutral", 0.50
+
+
+def _score_news_sentiment(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+
+    texts = [
+        f"{item.get('headline', '')}. {item.get('summary', '')}".strip()
+        for item in items
+    ]
+    try:
+        results = _get_sentiment_pipeline()(texts, truncation=True)
+    except Exception:
+        results = []
+
+    scored: List[Dict[str, Any]] = []
+    for index, item in enumerate(items):
+        if index < len(results):
+            label = str(results[index].get("label", "neutral")).lower()
+            confidence = float(results[index].get("score", 0.0))
+        else:
+            label, confidence = _fallback_sentiment(str(item.get("headline", "")))
+
+        if label not in {"positive", "negative", "neutral"}:
+            label = "neutral"
+        ui_sentiment = {"positive": "good", "negative": "bad", "neutral": "neutral"}[label]
+        published = item.get("published_ts")
+        scored.append(
+            {
+                **item,
+                "sentiment": ui_sentiment,
+                "sentiment_label": label,
+                "sentiment_score": round(confidence, 4),
+                "time": _format_relative_time(published),
+                "published": published.isoformat() if published is not None else None,
+            }
+        )
+    return scored
+
+
+def _build_news_thesis(ticker: str, scored_items: List[Dict[str, Any]], sentiment_score: float) -> str:
+    if not scored_items:
+        return f"No recent live headlines were found for {ticker}; news sentiment is neutral."
+    positive = sum(1 for item in scored_items if item["sentiment"] == "good")
+    negative = sum(1 for item in scored_items if item["sentiment"] == "bad")
+    lead = scored_items[0]
+    if sentiment_score >= 72:
+        tone = "positive"
+    elif sentiment_score <= 45:
+        tone = "negative"
+    else:
+        tone = "mixed"
+    return (
+        f"Live news tone is {tone}: {positive} positive and {negative} negative "
+        f"signals, led by {lead['source']}: {lead['headline']}"
+    )
+
+
+def _build_news_response(ticker: str, limit: int) -> Dict[str, Any]:
+    display_ticker = (ticker or "").strip().upper()
+    source_ticker = _normalize_news_ticker(display_ticker)
+    raw_items = _fetch_live_news(source_ticker)
+    scored_items = _score_news_sentiment(raw_items[: max(limit * 2, limit)])[:limit]
+    if scored_items:
+        sentiment_score = float(
+            np.mean([NEWS_SENTIMENT_POINTS.get(item["sentiment"], 50.0) for item in scored_items])
+        )
+    else:
+        sentiment_score = 50.0
+
+    response = {
+        "ticker": display_ticker,
+        "source_ticker": source_ticker,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "is_live": True,
+        "news_sentiment_score": round(sentiment_score, 2),
+        "thesis": _build_news_thesis(display_ticker, scored_items, sentiment_score),
+        "items": [
+            {
+                "headline": item["headline"],
+                "source": item["source"],
+                "time": item["time"],
+                "sentiment": item["sentiment"],
+                "sentiment_label": item["sentiment_label"],
+                "sentiment_score": item["sentiment_score"],
+                "link": item.get("link", ""),
+                "published": item.get("published"),
+            }
+            for item in scored_items
+        ],
+    }
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +488,27 @@ class PriceResponse(BaseModel):
     change_pct: Optional[float] = None
 
 
+class NewsItem(BaseModel):
+    headline: str
+    source: str
+    time: str
+    sentiment: str
+    sentiment_label: str
+    sentiment_score: float
+    link: str = ""
+    published: Optional[str] = None
+
+
+class NewsResponse(BaseModel):
+    ticker: str
+    source_ticker: str
+    generated_at: str
+    is_live: bool
+    news_sentiment_score: float
+    thesis: str
+    items: List[NewsItem]
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -233,6 +521,32 @@ def root():
 def health():
     models_loaded = _load_models() is not None
     return {"status": "ok", "models_loaded": models_loaded}
+
+
+@app.get("/api/news/{ticker}", response_model=NewsResponse)
+def api_news(ticker: str, limit: int = 4):
+    """Return live RSS headlines scored with FinBERT for frontend news cards and ranking."""
+    ticker_norm = (ticker or "").strip().upper()
+    if not ticker_norm:
+        raise HTTPException(status_code=400, detail="Ticker is required")
+    safe_limit = max(1, min(int(limit or 4), 12))
+    cache_key = (_normalize_news_ticker(ticker_norm), safe_limit)
+    cached = _news_cache.get(cache_key)
+    if cached is not None:
+        cached_at, payload = cached
+        if time.monotonic() - cached_at < NEWS_CACHE_TTL_SECONDS:
+            return payload
+
+    try:
+        payload = _build_news_response(ticker_norm, safe_limit)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"News provider unavailable: {exc}") from exc
+
+    _news_cache[cache_key] = (time.monotonic(), payload)
+    if len(_news_cache) > NEWS_CACHE_MAX_ENTRIES:
+        oldest_key = min(_news_cache, key=lambda key: _news_cache[key][0])
+        _news_cache.pop(oldest_key, None)
+    return payload
 
 
 @app.get("/api/market", response_model=List[MacroItem])

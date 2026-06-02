@@ -64,6 +64,7 @@ function resolveApiBaseUrl() {
 }
 const API_BASE_URL = resolveApiBaseUrl().replace(/\/$/, '');
 const LIVE_POLL_MS = 60 * 1000;
+const NEWS_POLL_MS = 15 * 60 * 1000;
 const WATCHLIST_STORAGE_KEY = 'globalMarketPredictor_watchlist_v1';
 const WATCHLIST_MAX = 30;
 const DETAIL_CHART_MAX_POINTS = 260;
@@ -214,6 +215,35 @@ async function fetchLiveQuote(ticker) {
   } catch {
     return null;
   }
+}
+
+async function fetchStockNews(ticker, { signal, limit = 4 } = {}) {
+  const url = `${API_BASE_URL}/api/news/${encodeURIComponent(ticker)}?limit=${encodeURIComponent(limit)}`;
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`News API returned ${res.status} ${res.statusText}`);
+  const json = await res.json();
+  const items = Array.isArray(json?.items) ? json.items : [];
+  return {
+    ticker: String(json?.ticker || ticker).toUpperCase(),
+    newsSentimentScore: Number.isFinite(Number(json?.news_sentiment_score))
+      ? Number(json.news_sentiment_score)
+      : 50,
+    thesis: typeof json?.thesis === 'string' ? json.thesis : '',
+    generatedAt: json?.generated_at || null,
+    isLive: json?.is_live === true,
+    items: items
+      .filter((item) => item && typeof item.headline === 'string' && item.headline.trim())
+      .map((item) => ({
+        headline: item.headline,
+        source: item.source || 'Live RSS',
+        time: item.time || 'recent',
+        sentiment: ['good', 'bad', 'neutral'].includes(item.sentiment) ? item.sentiment : 'neutral',
+        sentimentLabel: item.sentiment_label || item.sentiment || 'neutral',
+        sentimentScore: Number.isFinite(Number(item.sentiment_score)) ? Number(item.sentiment_score) : 0,
+        link: item.link || '',
+        published: item.published || null,
+      })),
+  };
 }
 
 function formatSyncedTime(ts) {
@@ -755,158 +785,32 @@ const STOCK_AI_RATINGS = {
   },
 };
 
-// Per-ticker news feed — 4 items each: headline, source, time, sentiment (good|bad|neutral)
-const STOCK_NEWS = {
-  AAPL: [
-    { headline: "Apple Intelligence EU rollout clears final regulatory hurdle, launches this quarter", source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "iPhone 17 supply chain data signals record Asia pre-orders ahead of September event", source: "Reuters",   time: "3h ago",  sentiment: "good"    },
-    { headline: "Apple TV+ subscriber growth stalls as Netflix and Amazon dominate content spend",    source: "CNBC",      time: "6h ago",  sentiment: "bad"     },
-    { headline: "Services segment on track for $100B annual run rate, well ahead of consensus",       source: "MS Research",time: "9h ago",  sentiment: "good"    },
-  ],
-  NVDA: [
-    { headline: "Blackwell GPU allocation fully committed through Q3 2026 as hyperscaler orders surge",   source: "Bloomberg",     time: "30m ago", sentiment: "good"    },
-    { headline: "New China export curbs could reduce NVIDIA data center revenue by up to 15%",           source: "Reuters",       time: "2h ago",  sentiment: "bad"     },
-    { headline: "Microsoft Azure placing record GPU cluster order for 2025 infrastructure buildout",     source: "The Information",time: "4h ago",  sentiment: "good"    },
-    { headline: "NVIDIA NVLink 5.0 unveiled at developer conference, doubling interconnect bandwidth",   source: "TechCrunch",    time: "6h ago",  sentiment: "good"    },
-  ],
-  MSFT: [
-    { headline: "Azure cloud growth re-accelerates to 33% YoY, beating consensus by three percentage points", source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "Copilot enterprise seat additions tracking 2× faster than internal forecast, sources say",   source: "The Information", time: "3h ago",  sentiment: "good"    },
-    { headline: "EU regulators launch formal probe into Microsoft Teams bundling practices",                  source: "Reuters",   time: "5h ago",  sentiment: "bad"     },
-    { headline: "OpenAI partnership structure limits third-party cloud monetization, analysts caution",       source: "FT",        time: "1d ago",  sentiment: "neutral" },
-  ],
-  TSLA: [
-    { headline: "Tesla Q3 deliveries miss analyst estimates as aggressive price cuts fail to clear inventory", source: "Reuters",  time: "2h ago",  sentiment: "bad"     },
-    { headline: "BYD and local rivals take record China EV market share at Tesla's direct expense",           source: "Bloomberg", time: "4h ago",  sentiment: "bad"     },
-    { headline: "FSD v13 beta receives broadly positive tester feedback; NHTSA review remains pending",       source: "Electrek",  time: "6h ago",  sentiment: "good"    },
-    { headline: "Tesla Megapack orders surge as utility-scale battery storage demand hits all-time high",     source: "CNBC",      time: "8h ago",  sentiment: "good"    },
-  ],
-  AMZN: [
-    { headline: "AWS revenue growth accelerates for second straight quarter, reaching 19% YoY",           source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "Amazon ad business surpasses $60B annual run rate, closing gap with Google at pace",     source: "Reuters",   time: "3h ago",  sentiment: "good"    },
-    { headline: "Prime Video ad-tier churn spikes following price increase, disappointing management",    source: "WSJ",       time: "5h ago",  sentiment: "bad"     },
-    { headline: "Amazon Pharmacy expansion to 50 cities ahead of schedule, One Medical synergies cited", source: "CNBC",      time: "8h ago",  sentiment: "neutral" },
-  ],
-  META: [
-    { headline: "Meta AI assistant reaches 1B monthly active users across Facebook and Instagram",          source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "Threads surpasses 300M DAU, directly threatening X's remaining advertiser relationships", source: "Reuters",   time: "3h ago",  sentiment: "good"    },
-    { headline: "Reality Labs posts $4.5B quarterly operating loss; investor patience increasingly strained", source: "FT",      time: "5h ago",  sentiment: "bad"     },
-    { headline: "Meta ad pricing rises 14% QoQ driven by improved AI-powered targeting performance",        source: "CNBC",     time: "7h ago",  sentiment: "good"    },
-  ],
-  GOOGL: [
-    { headline: "Google Search holds 90% global share despite Bing AI launch — Similarweb data",    source: "Bloomberg", time: "2h ago",  sentiment: "good"    },
-    { headline: "Google Cloud accelerates to 28% growth, narrowing gap with Azure and AWS meaningfully", source: "Reuters", time: "3h ago",  sentiment: "good"    },
-    { headline: "DOJ antitrust ruling could force Google to divest its ad tech stack entirely",         source: "WSJ",      time: "5h ago",  sentiment: "bad"     },
-    { headline: "YouTube Shorts CPMs now on par with long-form content for first time",                 source: "CNBC",     time: "8h ago",  sentiment: "good"    },
-  ],
-  'BRK.B': [
-    { headline: "Berkshire cash reserves hit record $189B, signaling Buffett finds limited value at current prices", source: "Bloomberg", time: "2h ago",  sentiment: "neutral" },
-    { headline: "BNSF Railway intermodal volumes recover 4% QoQ as freight markets stabilise",                      source: "Reuters",   time: "4h ago",  sentiment: "good"    },
-    { headline: "Berkshire further reduces Apple stake; single-position concentration now below 40%",               source: "FT",        time: "6h ago",  sentiment: "neutral" },
-    { headline: "GEICO combined loss ratio improves to best reading in six years after underwriting reforms",        source: "WSJ",       time: "1d ago",  sentiment: "good"    },
-  ],
-  V: [
-    { headline: "Visa cross-border travel volume up 16% YoY as global tourism surpasses 2019 levels",  source: "Bloomberg", time: "1h ago",  sentiment: "good" },
-    { headline: "Visa Value-Added Services revenue growing 3× faster than core network volumes",        source: "Reuters",   time: "3h ago",  sentiment: "good" },
-    { headline: "DOJ files antitrust suit alleging Visa monopolised the US debit card market",          source: "WSJ",       time: "5h ago",  sentiment: "bad"  },
-    { headline: "Tap-to-pay penetration in Southeast Asia accelerating Visa's volume growth thesis",    source: "CNBC",      time: "8h ago",  sentiment: "neutral" },
-  ],
-  UNH: [
-    { headline: "UnitedHealth raises full-year guidance on stronger-than-expected Optum performance",          source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "Congress proposes pharmacy benefit manager reform bill directly targeting Optum Rx unit",     source: "Reuters",   time: "3h ago",  sentiment: "bad"     },
-    { headline: "2025 Medicare Advantage rate cuts come in below worst-case analyst scenario",                 source: "WSJ",       time: "5h ago",  sentiment: "neutral" },
-    { headline: "Optum Health clinic expansion adds 200 locations in Q3, ahead of full-year build target",    source: "CNBC",      time: "7h ago",  sentiment: "good"    },
-  ],
-  JPM: [
-    { headline: "JPMorgan Q3 net interest income beats estimates as loan margins hold above guidance",  source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "Investment banking fees surge 35% YoY as M&A pipeline reopens across sectors",        source: "Reuters",   time: "3h ago",  sentiment: "good"    },
-    { headline: "JPMorgan increases loan-loss provisions citing rising consumer delinquency rates",     source: "FT",        time: "5h ago",  sentiment: "bad"     },
-    { headline: "Dimon warns of 'troubling times ahead' citing geopolitical and fiscal deficit risks", source: "CNBC",      time: "7h ago",  sentiment: "neutral" },
-  ],
-  JNJ: [
-    { headline: "J&J Darzalex hits $10B annual sales milestone four years ahead of original forecast", source: "Bloomberg", time: "2h ago",  sentiment: "good" },
-    { headline: "Talc bankruptcy settlement clears final legal hurdle, removing $10B liability overhang", source: "Reuters", time: "4h ago",  sentiment: "good" },
-    { headline: "MedTech segment margins compress as hospital capex cycle remains cautious",            source: "FT",        time: "6h ago",  sentiment: "bad"  },
-    { headline: "J&J raises dividend for 62nd consecutive year, reaffirming Dividend Aristocrat status", source: "WSJ",    time: "1d ago",  sentiment: "good" },
-  ],
-  WMT: [
-    { headline: "Walmart+ membership tops 25M subscribers, accelerating toward Amazon Prime parity",    source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "Walmart advertising revenue grows 26% YoY, cementing top-5 US digital ad position",   source: "Reuters",   time: "2h ago",  sentiment: "good"    },
-    { headline: "Grocery price deflation compresses same-store sales growth below prior-year comparisons", source: "WSJ",   time: "5h ago",  sentiment: "neutral" },
-    { headline: "E-commerce fulfillment cost-reduction initiative saving $500M annually, ahead of plan", source: "CNBC",   time: "7h ago",  sentiment: "good"    },
-  ],
-  XOM: [
-    { headline: "ExxonMobil Permian output reaches record 1.2M bbl/day following Pioneer integration",  source: "Bloomberg", time: "2h ago",  sentiment: "good" },
-    { headline: "Brent crude slides below $74 on OPEC+ supply increase signals, margin headwind cited", source: "Reuters",   time: "4h ago",  sentiment: "bad"  },
-    { headline: "ExxonMobil carbon capture project receives $1.2B DOE funding approval",                source: "FT",        time: "6h ago",  sentiment: "good" },
-    { headline: "Downstream refining margins tighten as global refinery capacity additions accelerate", source: "WSJ",       time: "8h ago",  sentiment: "bad"  },
-  ],
-  MA: [
-    { headline: "Mastercard cross-border volumes up 18% YoY, beating all major consensus estimates",        source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "Mastercard Move real-time payments platform now live across 140+ countries",               source: "Reuters",   time: "3h ago",  sentiment: "good"    },
-    { headline: "DOJ antitrust probe of debit network parallels Visa suit; MA shares fall 3% in pre-market", source: "WSJ",    time: "5h ago",  sentiment: "bad"     },
-    { headline: "Mastercard raises full-year net revenue growth guidance to 12-13% from 11-12%",            source: "CNBC",     time: "7h ago",  sentiment: "good"    },
-  ],
-  AVGO: [
-    { headline: "Broadcom custom AI chip revenue from hyperscalers set to exceed $12B in FY2025",       source: "Bloomberg",      time: "1h ago",  sentiment: "good"    },
-    { headline: "VMware integration ahead of schedule; $8.5B synergy target raised to $9B by management", source: "Reuters",     time: "3h ago",  sentiment: "good"    },
-    { headline: "Broadcom leverage ratio concerns mount among fixed-income investors post-acquisition",  source: "FT",             time: "5h ago",  sentiment: "neutral" },
-    { headline: "Google and Meta expand custom ASIC co-design partnerships with Broadcom through 2027", source: "The Information", time: "7h ago",  sentiment: "good"    },
-  ],
-  PG: [
-    { headline: "P&G premium pricing sticks across categories despite consumer trade-down concerns",          source: "Bloomberg", time: "2h ago",  sentiment: "good"    },
-    { headline: "Organic revenue growth moderates to 3% as volume recovery lags price contribution",         source: "Reuters",   time: "4h ago",  sentiment: "neutral" },
-    { headline: "P&G increases quarterly dividend 5%, marking 68th consecutive annual increase",             source: "WSJ",       time: "6h ago",  sentiment: "good"    },
-    { headline: "Asia and Africa volume recovery outpacing management forecast by a meaningful margin",       source: "CNBC",      time: "8h ago",  sentiment: "good"    },
-  ],
-  ORCL: [
-    { headline: "Oracle cloud GPU bookings surge 78% QoQ as hyperscalers diversify away from AWS",       source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "Remaining performance obligations hit $98B, doubling in just two years",                source: "Reuters",   time: "3h ago",  sentiment: "good"    },
-    { headline: "Legacy on-premise database licensing decline accelerates, now -9% YoY vs -5% prior",   source: "FT",        time: "5h ago",  sentiment: "bad"     },
-    { headline: "Oracle net debt-to-EBITDA at highest since 2010 acquisition cycle, limiting buybacks", source: "WSJ",       time: "8h ago",  sentiment: "bad"     },
-  ],
-  COST: [
-    { headline: "Costco renewal rates hit all-time record of 93% globally in latest quarterly filing",   source: "Bloomberg", time: "1h ago",  sentiment: "good"    },
-    { headline: "Costco gold bullion sales surpass $200M/month, disrupting traditional jewellery retail", source: "Reuters",  time: "3h ago",  sentiment: "good"    },
-    { headline: "First membership fee increase in seven years draws mixed consumer reaction online",     source: "WSJ",       time: "5h ago",  sentiment: "neutral" },
-    { headline: "International comparable sales growth of 8% significantly outpacing domestic segment", source: "CNBC",      time: "7h ago",  sentiment: "good"    },
-  ],
-  HD: [
-    { headline: "Home Depot Pro segment grows 11% YoY as SRS Distribution integration delivers ahead of plan", source: "Bloomberg", time: "2h ago",  sentiment: "good" },
-    { headline: "Existing home sales hit 14-year low, creating direct headwind for DIY remodeling spend",       source: "Reuters",   time: "4h ago",  sentiment: "bad"  },
-    { headline: "Home Depot raises dividend 10%, signaling management confidence in multi-year outlook",        source: "WSJ",       time: "6h ago",  sentiment: "good" },
-    { headline: "Comparable store sales down 3.2% as high mortgage rates suppress discretionary projects",     source: "CNBC",      time: "8h ago",  sentiment: "bad"  },
-  ],
-};
-
 const NEWS_SENTIMENT_POINTS = { good: 100, neutral: 65, bad: 35 };
-const TOP_AI_STOCK_PICK_THESES = {
-  NVDA: 'Blackwell demand and hyperscaler GPU commitments keep the AI infrastructure thesis intact despite export-control noise.',
-  MSFT: 'Azure re-acceleration and Copilot seat growth support durable enterprise AI monetization with a fortress balance sheet.',
-  META: 'AI-powered ad targeting is lifting pricing while broad Meta AI adoption adds a new engagement layer across the app family.',
-  AVGO: 'Custom AI silicon wins and VMware synergies point to expanding free cash flow as hyperscalers diversify beyond GPUs.',
-  AAPL: 'Apple Intelligence rollout and services momentum improve the upgrade-cycle setup while brand loyalty protects downside.',
-};
 
-function getNewsSentimentScore(ticker) {
-  const items = STOCK_NEWS[ticker] ?? [];
+function getNewsSentimentScore(newsRecord) {
+  if (Number.isFinite(Number(newsRecord?.newsSentimentScore))) {
+    return Number(newsRecord.newsSentimentScore);
+  }
+  const items = newsRecord?.items ?? [];
   if (items.length === 0) return 50;
   return items.reduce((sum, item) => sum + (NEWS_SENTIMENT_POINTS[item.sentiment] ?? 50), 0) / items.length;
 }
 
-function buildTopAiStockPickRows() {
+function buildTopAiStockPickRows(newsByTicker = {}) {
   return TOP_US_STOCKS.map((stock) => {
     const rating = STOCK_AI_RATINGS[stock.ticker];
     const aiScore = rating?.score ?? 0;
     const signal = getSignal(aiScore);
-    const newsSentimentScore = getNewsSentimentScore(stock.ticker);
+    const liveNews = newsByTicker[stock.ticker];
+    const newsSentimentScore = getNewsSentimentScore(liveNews);
     return {
       ticker: stock.ticker,
       name: stock.name,
       aiScore,
       signal,
       pickScore: (aiScore * 0.82) + (newsSentimentScore * 0.18),
-      thesis: TOP_AI_STOCK_PICK_THESES[stock.ticker] ?? rating?.summary ?? '',
+      thesis: liveNews?.thesis || rating?.summary || '',
+      hasLiveNews: liveNews?.isLive === true,
     };
   })
     .filter((row) => row.signal?.label === 'Strong Buy' || row.signal?.label === 'Buy')
@@ -1034,10 +938,9 @@ const MiniStockChart = React.memo(function MiniStockChart({ stock }) {
   && prev.stock?.changePercent === next.stock?.changePercent
 ));
 
-// Bloomberg-style news intelligence feed with AI sentiment badges + pulse animations
-function MarketIntelligence({ ticker }) {
-  const items = STOCK_NEWS[ticker] ?? [];
-  if (items.length === 0) return null;
+// Live news intelligence feed with AI sentiment badges + pulse animations
+function MarketIntelligence({ ticker, items = [], isLoading = false, error = '' }) {
+  if (!isLoading && items.length === 0 && !error) return null;
 
   return (
     <div className={`${CARD_BASE} p-5 mb-6`}>
@@ -1061,11 +964,30 @@ function MarketIntelligence({ ticker }) {
           </span>
           <h3 className="text-xs font-semibold text-gray-300 uppercase tracking-[0.18em]">Market Intelligence</h3>
         </div>
-        <span className="text-[10px] font-medium text-gray-600 uppercase tracking-wider">AI Sentiment · Live Feed</span>
+        <span className="text-[10px] font-medium text-gray-600 uppercase tracking-wider">
+          AI Sentiment · Live RSS · {ticker}
+        </span>
       </div>
 
       {/* ── News cards grid ── */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+      {error && (
+        <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3 text-xs text-amber-200 mb-3">
+          Live news is temporarily unavailable: {error}
+        </div>
+      )}
+      {isLoading && items.length === 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          {[0, 1, 2, 3].map((idx) => (
+            <div key={idx} className="rounded-xl border border-slate-800 bg-[#0f1118] p-4">
+              <div className="h-4 w-20 rounded bg-slate-800 animate-pulse mb-4" />
+              <div className="h-3 w-full rounded bg-slate-800 animate-pulse mb-2" />
+              <div className="h-3 w-4/5 rounded bg-slate-800 animate-pulse" />
+            </div>
+          ))}
+        </div>
+      )}
+      {items.length > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
         {items.map((item, idx) => {
           const isGood    = item.sentiment === 'good';
           const isBad     = item.sentiment === 'bad';
@@ -1121,7 +1043,8 @@ function MarketIntelligence({ ticker }) {
             </div>
           );
         })}
-      </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1412,6 +1335,9 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
   const [isFallback, setIsFallback] = useState(false);
   const [lastChartSynced, setLastChartSynced] = useState(null);
   const [chartTimeRange, setChartTimeRange] = useState('3mo');
+  const [newsItems, setNewsItems] = useState([]);
+  const [isNewsLoading, setIsNewsLoading] = useState(false);
+  const [newsError, setNewsError] = useState('');
   const [showConsensusExplainer, setShowConsensusExplainer] = useState(false);
   const initialSyncNotifiedRef = useRef(false);
   const isGain = (percentageChange ?? 0) >= 0;
@@ -1473,6 +1399,37 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
       clearInterval(id);
     };
   }, [stock.ticker, onInitialSyncComplete]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 25_000);
+
+    setNewsItems([]);
+    setNewsError('');
+    setIsNewsLoading(true);
+
+    fetchStockNews(stock.ticker, { signal: controller.signal, limit: 4 })
+      .then((news) => {
+        if (cancelled) return;
+        setNewsItems(news.items);
+      })
+      .catch((err) => {
+        if (cancelled || err?.name === 'AbortError') return;
+        console.error('[GlobalMarketPredictor] FastAPI news fetch error:', err);
+        setNewsError(err?.message || 'News fetch failed');
+      })
+      .finally(() => {
+        clearTimeout(timeoutId);
+        if (!cancelled) setIsNewsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [stock.ticker]);
 
   // Fetch chart data from FastAPI (/api/analyze) — historical prices only (no forecast UI)
   useEffect(() => {
@@ -1637,7 +1594,12 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
       </div>
 
       {/* ── Market Intelligence — AI news feed, below header, above chart ── */}
-      <MarketIntelligence ticker={stock.ticker} />
+      <MarketIntelligence
+        ticker={stock.ticker}
+        items={newsItems}
+        isLoading={isNewsLoading}
+        error={newsError}
+      />
 
       {/* ── Main chart ── */}
       <div className={`${CARD_BASE} p-6 mb-6`}>
@@ -2454,6 +2416,8 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
   const [watchlistQuotes, setWatchlistQuotes] = useState({});
   const [isSyncingTables, setIsSyncingTables] = useState(false);
   const [lastTablesSynced, setLastTablesSynced] = useState(null);
+  const [newsByTicker, setNewsByTicker] = useState({});
+  const [isNewsSyncing, setIsNewsSyncing] = useState(false);
   useEffect(() => {
     let cancelled = false;
     const fetchFearGreed = async () => {
@@ -2474,6 +2438,46 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
     const id = setInterval(fetchFearGreed, LIVE_POLL_MS);
     return () => {
       cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let controller = null;
+    const tickers = TOP_US_STOCKS
+      .filter((stock) => {
+        const score = STOCK_AI_RATINGS[stock.ticker]?.score ?? 0;
+        const label = getSignal(score)?.label;
+        return label === 'Strong Buy' || label === 'Buy';
+      })
+      .map((stock) => stock.ticker);
+
+    const fetchNewsBatch = async () => {
+      controller?.abort();
+      controller = new AbortController();
+      if (!cancelled) setIsNewsSyncing(true);
+      const results = await Promise.allSettled(
+        tickers.map((ticker) => fetchStockNews(ticker, { signal: controller.signal, limit: 4 })),
+      );
+      if (cancelled) return;
+      const next = {};
+      results.forEach((result) => {
+        if (result.status === 'fulfilled') {
+          next[result.value.ticker] = result.value;
+        }
+      });
+      if (Object.keys(next).length > 0) {
+        setNewsByTicker((prev) => ({ ...prev, ...next }));
+      }
+      setIsNewsSyncing(false);
+    };
+
+    fetchNewsBatch();
+    const id = setInterval(fetchNewsBatch, NEWS_POLL_MS);
+    return () => {
+      cancelled = true;
+      controller?.abort();
       clearInterval(id);
     };
   }, []);
@@ -2556,7 +2560,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
 
   const demoPortfolioRows = useMemo(() => buildDemoPortfolioRows(liveQuotes), [liveQuotes]);
   const demoPortfolioTotals = useMemo(() => sumDemoPortfolioTotals(demoPortfolioRows), [demoPortfolioRows]);
-  const topAiStockPickRows = useMemo(() => buildTopAiStockPickRows(), []);
+  const topAiStockPickRows = useMemo(() => buildTopAiStockPickRows(newsByTicker), [newsByTicker]);
 
   const fearGreedTimelineData = [
     { month: 'Jan', fearGreed: 31, sp500: 4720 },
@@ -2723,12 +2727,12 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
               <div>
                 <h3 className="text-sm font-semibold text-white uppercase tracking-wider">Top 5 AI Stock Picks</h3>
                 <p className="text-[10px] text-gray-500 mt-0.5">
-                  Ranked by the model signal and recent news sentiment; using mock picks until the backend supplies this list.
+                  Ranked by the model signal plus live RSS headlines scored by FinBERT NLP.
                 </p>
               </div>
             </div>
             <div className="text-[10px] text-gray-500 uppercase tracking-wider">
-              AI score + news sentiment
+              {isNewsSyncing ? 'Syncing live news...' : 'AI score + live news NLP'}
             </div>
           </div>
           <div className="overflow-x-auto">
@@ -2777,7 +2781,12 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
                         <span className="text-[11px] font-normal text-gray-500">/100</span>
                       </td>
                       <td className="py-3 px-3 text-sm text-gray-300 leading-snug">
-                        {row.thesis}
+                        <div className="flex flex-col gap-1">
+                          <span>{row.thesis}</span>
+                          <span className={`text-[10px] uppercase tracking-wider ${row.hasLiveNews ? 'text-emerald-400' : 'text-gray-600'}`}>
+                            {row.hasLiveNews ? 'Live RSS + FinBERT' : 'AI model fallback'}
+                          </span>
+                        </div>
                       </td>
                     </tr>
                   );
