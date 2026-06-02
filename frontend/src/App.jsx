@@ -884,13 +884,16 @@ function generateDetailChartData(stock, points = 90) {
 }
 
 // 30 realistic mock candles seeded from the ticker so they never flicker on re-render.
-// Used whenever the live Finnhub candle call fails (rate limit, market closed, etc.).
-function generateFallbackCandles(stock, points = 30) {
+// Used only when both the FastAPI backend AND its Yahoo HTTP fallback are unavailable.
+// `livePrice` (optional) anchors the simulation around the latest real quote so the
+// fallback chart visually matches the price displayed in the header instead of the
+// stale hardcoded `stock.price` from the bundled snapshot.
+function generateFallbackCandles(stock, points = 30, livePrice = null) {
   const seed = stock.ticker.split('').reduce((a, c) => a * 31 + c.charCodeAt(0), 1);
   const rng = (i) => Math.abs(Math.sin(seed * 0.0013 + i * 1.618033));
-  const base = stock.price ?? 100;
+  const base = Number.isFinite(livePrice) && livePrice > 0 ? livePrice : (stock.price ?? 100);
   const bias = (stock.changePercent ?? 0) / 100;
-  const floor = (stock.low52 ?? base * 0.7) * 0.92;
+  const floor = base * 0.85;
   const fmt = new Intl.DateTimeFormat('en-US', { month: 'numeric', day: 'numeric' });
   const now = Date.now();
   return Array.from({ length: points }, (_, i) => {
@@ -1383,13 +1386,17 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
     };
   }, [stock.ticker]);
 
-  // Fetch chart data from FastAPI (/api/analyze) — historical prices only (no forecast UI)
+  // Fetch chart data from FastAPI (/api/analyze) — historical prices only (no forecast UI).
+  // The FastAPI backend already falls back to a direct Yahoo Finance HTTP call when
+  // yfinance is rate-limited, so the chart almost always reflects real prices. We add a
+  // single retry to cover Render cold-starts, and only render the simulated fallback
+  // (anchored to the live Finnhub `currentPrice`) when both attempts fail.
   useEffect(() => {
     let cancelled = false;
     setFullChartData([]);
     setIsFallback(false);
-    const fetchChart = async () => {
-      setIsChartSyncing(true);
+
+    const attemptFetch = async () => {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 20_000);
       try {
@@ -1397,33 +1404,73 @@ function StockDetailPage({ stock, onBack, onInitialSyncComplete, isInWatchlist, 
         const res = await fetch(url, { signal: controller.signal });
         if (!res.ok) throw new Error(`API returned ${res.status} ${res.statusText}`);
         const json = await res.json();
+        const raw = Array.isArray(json.chart_data) ? json.chart_data : [];
+        const chartData = raw
+          .filter((d) => d != null && d.price != null)
+          .map((d) => ({ date: d.date, price: d.price }));
+        if (chartData.length === 0) throw new Error('API returned no historical prices');
+        return chartData;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    };
+
+    const fetchChart = async () => {
+      setIsChartSyncing(true);
+      try {
+        let chartData;
+        try {
+          chartData = await attemptFetch();
+        } catch (err1) {
+          console.warn('[GlobalMarketPredictor] /api/analyze attempt 1 failed; retrying:', err1?.message || err1);
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          if (cancelled) return;
+          chartData = await attemptFetch();
+        }
         if (!cancelled) {
-          const raw = Array.isArray(json.chart_data) ? json.chart_data : [];
-          const chartData = raw
-            .filter((d) => d != null && d.price != null)
-            .map((d) => ({ date: d.date, price: d.price }));
           setFullChartData(chartData);
           setIsFallback(false);
           setLastChartSynced(Date.now());
         }
       } catch (err) {
-        console.error('[GlobalMarketPredictor] FastAPI chart fetch error:', err);
+        console.error('[GlobalMarketPredictor] FastAPI chart fetch error (after retry):', err);
         if (!cancelled) {
+          const liveAnchor = Number.isFinite(currentPrice) && currentPrice > 0
+            ? currentPrice
+            : (stock.price ?? null);
           setFullChartData(
-            generateFallbackCandles(stock).map((d) => ({
+            generateFallbackCandles(stock, 30, liveAnchor).map((d) => ({
               date: d.date, price: d.value,
             })),
           );
           setIsFallback(true);
+          setLastChartSynced(Date.now());
         }
       } finally {
-        clearTimeout(timeoutId);
         if (!cancelled) setIsChartSyncing(false);
       }
     };
     fetchChart();
     return () => { cancelled = true; };
+    // `currentPrice` intentionally omitted: we don't want to re-fetch on every live tick.
+    // If we DID fall back to simulated, a later `currentPrice` update will re-anchor
+    // the chart via the dedicated effect below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stock.ticker, chartTimeRange]);
+
+  // If we rendered the simulated fallback (API down) and the live Finnhub quote later
+  // arrives, re-anchor the fake series to the real price so the chart Y-axis matches
+  // the header. This avoids the previous bug where the chart hovered around the
+  // bundled snapshot price ($118) while the header showed the real live price ($224).
+  useEffect(() => {
+    if (!isFallback) return;
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) return;
+    setFullChartData(
+      generateFallbackCandles(stock, 30, currentPrice).map((d) => ({
+        date: d.date, price: d.value,
+      })),
+    );
+  }, [isFallback, currentPrice, stock]);
 
   const displayData = useMemo(
     () => sampleChartData(fullChartData, DETAIL_CHART_MAX_POINTS),
