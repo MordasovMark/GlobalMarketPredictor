@@ -188,6 +188,113 @@ def _parse_news_feed(url: str, fallback_source: str) -> List[Dict[str, Any]]:
     return records
 
 
+def _news_dedupe_key(headline: str) -> str:
+    return re.sub(r"\W+", "", str(headline).lower())
+
+
+def _within_news_lookback(published: Optional[pd.Timestamp]) -> bool:
+    if published is None:
+        return True
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=NEWS_LOOKBACK_DAYS)
+    return published >= cutoff
+
+
+def _extract_yfinance_link(entry: Dict[str, Any], content: Dict[str, Any]) -> str:
+    for container in (content, entry):
+        for key in ("canonicalUrl", "clickThroughUrl"):
+            url_obj = container.get(key)
+            if isinstance(url_obj, dict):
+                url = str(url_obj.get("url") or "").strip()
+                if url:
+                    return url
+            elif isinstance(url_obj, str) and url_obj.strip():
+                return url_obj.strip()
+    return str(entry.get("link") or entry.get("url") or "").strip()
+
+
+def _parse_yfinance_news_entries(raw_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize yfinance Ticker.news payloads into the shared news record shape."""
+    records: List[Dict[str, Any]] = []
+    for entry in raw_entries or []:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content") if isinstance(entry.get("content"), dict) else entry
+        headline = _clean_news_text(content.get("title") or entry.get("title"))
+        if not headline:
+            continue
+        summary = _clean_news_text(
+            content.get("summary")
+            or content.get("description")
+            or entry.get("summary")
+            or entry.get("description")
+            or ""
+        )
+        published_raw = (
+            content.get("pubDate")
+            or content.get("displayTime")
+            or entry.get("pubDate")
+            or entry.get("providerPublishTime")
+        )
+        published = _parse_published(published_raw)
+        if published is None and entry.get("providerPublishTime") is not None:
+            published = pd.to_datetime(entry["providerPublishTime"], unit="s", utc=True, errors="coerce")
+            if pd.isna(published):
+                published = None
+        provider = content.get("provider") if isinstance(content.get("provider"), dict) else {}
+        source = _clean_news_text(provider.get("displayName")) or "Yahoo Finance"
+        records.append(
+            {
+                "headline": headline,
+                "summary": summary,
+                "source": source,
+                "link": _extract_yfinance_link(entry, content),
+                "published_ts": published,
+                "provider": "yahoo_finance",
+            }
+        )
+    return records
+
+
+def _fetch_yfinance_news(ticker: str) -> List[Dict[str, Any]]:
+    """Fetch ticker headlines from the Yahoo Finance API via yfinance."""
+    symbol = _normalize_news_ticker(ticker)
+    symbols_to_try = [symbol]
+    if "-" in symbol:
+        symbols_to_try.append(symbol.replace("-", "."))
+
+    for sym in symbols_to_try:
+        try:
+            raw_entries = yf.Ticker(sym).news or []
+        except Exception:
+            continue
+        records = _parse_yfinance_news_entries(raw_entries)
+        if not records:
+            continue
+        return [record for record in records if _within_news_lookback(record.get("published_ts"))]
+    return []
+
+
+def _merge_news_records(
+    items: List[Dict[str, Any]],
+    seen: set[str],
+    records: List[Dict[str, Any]],
+    *,
+    require_relevance: bool,
+    source_ticker: str,
+) -> None:
+    for record in records:
+        published = record.get("published_ts")
+        if published is not None and not _within_news_lookback(published):
+            continue
+        if require_relevance and not _is_relevant_news_item(record, source_ticker):
+            continue
+        key = _news_dedupe_key(str(record.get("headline", "")))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append(record)
+
+
 def _fetch_live_news(ticker: str) -> List[Dict[str, Any]]:
     source_ticker = _normalize_news_ticker(ticker)
     query = urllib.parse.quote_plus(f"{source_ticker} stock news OR {source_ticker} market analysis")
@@ -202,21 +309,28 @@ def _fetch_live_news(ticker: str) -> List[Dict[str, Any]]:
         ),
     ]
 
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=NEWS_LOOKBACK_DAYS)
     seen: set[str] = set()
     items: List[Dict[str, Any]] = []
+    # Primary: Yahoo Finance API (yfinance) — reliable when RSS feeds are blocked or empty.
+    _merge_news_records(
+        items,
+        seen,
+        _fetch_yfinance_news(source_ticker),
+        require_relevance=False,
+        source_ticker=source_ticker,
+    )
+
     for url, fallback_source in urls:
-        for record in _parse_news_feed(url, fallback_source):
-            published = record.get("published_ts")
-            if published is not None and published < cutoff:
-                continue
-            if not _is_relevant_news_item(record, source_ticker):
-                continue
-            key = re.sub(r"\W+", "", str(record["headline"]).lower())
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            items.append(record)
+        feed_records = _parse_news_feed(url, fallback_source)
+        for record in feed_records:
+            record.setdefault("provider", "rss")
+        _merge_news_records(
+            items,
+            seen,
+            feed_records,
+            require_relevance=True,
+            source_ticker=source_ticker,
+        )
 
     items.sort(
         key=lambda item: item.get("published_ts") or pd.Timestamp.min.tz_localize("UTC"),
@@ -325,11 +439,22 @@ def _build_news_response(ticker: str, limit: int) -> Dict[str, Any]:
     else:
         sentiment_score = 50.0
 
+    providers = {str(item.get("provider", "rss")) for item in raw_items[: max(limit * 2, limit)]}
+    if "yahoo_finance" in providers and len(providers) > 1:
+        news_source = "yahoo_finance+rss"
+    elif "yahoo_finance" in providers:
+        news_source = "yahoo_finance"
+    elif providers:
+        news_source = "rss"
+    else:
+        news_source = "none"
+
     response = {
         "ticker": display_ticker,
         "source_ticker": source_ticker,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "is_live": True,
+        "is_live": bool(scored_items),
+        "news_source": news_source,
         "news_sentiment_score": round(sentiment_score, 2),
         "thesis": _build_news_thesis(display_ticker, scored_items, sentiment_score),
         "items": [
@@ -504,6 +629,7 @@ class NewsResponse(BaseModel):
     source_ticker: str
     generated_at: str
     is_live: bool
+    news_source: str = "none"
     news_sentiment_score: float
     thesis: str
     items: List[NewsItem]

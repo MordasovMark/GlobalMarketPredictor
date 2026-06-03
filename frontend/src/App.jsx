@@ -231,6 +231,7 @@ async function fetchStockNews(ticker, { signal, limit = 4 } = {}) {
     thesis: typeof json?.thesis === 'string' ? json.thesis : '',
     generatedAt: json?.generated_at || null,
     isLive: json?.is_live === true,
+    newsSource: typeof json?.news_source === 'string' ? json.news_source : 'none',
     items: items
       .filter((item) => item && typeof item.headline === 'string' && item.headline.trim())
       .map((item) => ({
@@ -787,6 +788,20 @@ const STOCK_AI_RATINGS = {
 
 const NEWS_SENTIMENT_POINTS = { good: 100, neutral: 65, bad: 35 };
 
+function getNewsSourceLabel(newsRecord) {
+  if (!newsRecord?.isLive || !(newsRecord?.items?.length ?? 0)) {
+    return 'AI model fallback';
+  }
+  const source = String(newsRecord?.newsSource || '').toLowerCase();
+  if (source.startsWith('yahoo_finance')) {
+    return 'Yahoo Finance + FinBERT';
+  }
+  if (source === 'rss') {
+    return 'Live RSS + FinBERT';
+  }
+  return 'Live news + FinBERT';
+}
+
 function getNewsSentimentScore(newsRecord) {
   if (Number.isFinite(Number(newsRecord?.newsSentimentScore))) {
     return Number(newsRecord.newsSentimentScore);
@@ -810,7 +825,8 @@ function buildTopAiStockPickRows(newsByTicker = {}) {
       signal,
       pickScore: (aiScore * 0.82) + (newsSentimentScore * 0.18),
       thesis: liveNews?.thesis || rating?.summary || '',
-      hasLiveNews: liveNews?.isLive === true,
+      hasLiveNews: Boolean(liveNews?.isLive && (liveNews?.items?.length ?? 0) > 0),
+      newsSourceLabel: getNewsSourceLabel(liveNews),
     };
   })
     .filter((row) => row.signal?.label === 'Strong Buy' || row.signal?.label === 'Buy')
@@ -965,7 +981,7 @@ function MarketIntelligence({ ticker, items = [], isLoading = false, error = '' 
           <h3 className="text-xs font-semibold text-gray-300 uppercase tracking-[0.18em]">Market Intelligence</h3>
         </div>
         <span className="text-[10px] font-medium text-gray-600 uppercase tracking-wider">
-          AI Sentiment · Live RSS · {ticker}
+          AI Sentiment · Yahoo Finance · {ticker}
         </span>
       </div>
 
@@ -2727,7 +2743,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
               <div>
                 <h3 className="text-sm font-semibold text-white uppercase tracking-wider">Top 5 AI Stock Picks</h3>
                 <p className="text-[10px] text-gray-500 mt-0.5">
-                  Ranked by the model signal plus live RSS headlines scored by FinBERT NLP.
+                  Ranked by the model signal plus Yahoo Finance headlines scored by FinBERT NLP.
                 </p>
               </div>
             </div>
@@ -2784,7 +2800,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
                         <div className="flex flex-col gap-1">
                           <span>{row.thesis}</span>
                           <span className={`text-[10px] uppercase tracking-wider ${row.hasLiveNews ? 'text-emerald-400' : 'text-gray-600'}`}>
-                            {row.hasLiveNews ? 'Live RSS + FinBERT' : 'AI model fallback'}
+                            {row.newsSourceLabel}
                           </span>
                         </div>
                       </td>
