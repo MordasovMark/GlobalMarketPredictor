@@ -49,7 +49,6 @@ class ErrorBoundary extends React.Component {
 const CARD_BASE = 'bg-[#12131a] border border-slate-800/80 rounded-xl';
 // Finnhub API key with hard-coded fallback so missing env does not break live data.
 const FINNHUB_API_TOKEN = (import.meta.env?.VITE_FINNHUB_KEY || 'd6r89m1r01qgdhqdj95gd6r89m1r01qgdhqdj960')?.trim?.();
-const FEAR_GREED_API_URL = 'http://127.0.0.1:5000/api/fear-greed';
 
 /** FastAPI backend base URL: local dev vs production (Render). Uses hostname so prod builds never default to localhost. */
 function resolveApiBaseUrl() {
@@ -63,6 +62,9 @@ function resolveApiBaseUrl() {
   return 'https://globalmarketpredictor.onrender.com';
 }
 const API_BASE_URL = resolveApiBaseUrl().replace(/\/$/, '');
+// Live CNN Fear & Greed Index (server-proxied — CNN blocks direct browser/bot calls without headers).
+const FEAR_GREED_API_URL = `${API_BASE_URL}/api/fear-greed`;
+const MACRO_API_URL = `${API_BASE_URL}/api/market`;
 const LIVE_POLL_MS = 60 * 1000;
 const NEWS_POLL_MS = 15 * 60 * 1000;
 const WATCHLIST_STORAGE_KEY = 'globalMarketPredictor_watchlist_v1';
@@ -92,6 +94,21 @@ const MOMENTUM_CHART_DATA = [
   { t: 'T-2', macd: 0.4, adx: 26 },
   { t: 'T-1', macd: 0.7, adx: 28 },
   { t: 'T', macd: 0.6, adx: 30 },
+];
+// Shown only until the live /api/fear-greed history loads on mount.
+const FALLBACK_FEAR_GREED_TIMELINE = [
+  { month: 'Jan', fearGreed: 31, sp500: 4720 },
+  { month: 'Feb', fearGreed: 38, sp500: 4890 },
+  { month: 'Mar', fearGreed: 29, sp500: 4810 },
+  { month: 'Apr', fearGreed: 45, sp500: 5020 },
+  { month: 'May', fearGreed: 41, sp500: 4940 },
+  { month: 'Jun', fearGreed: 56, sp500: 5110 },
+  { month: 'Jul', fearGreed: 48, sp500: 4980 },
+  { month: 'Aug', fearGreed: 35, sp500: 4860 },
+  { month: 'Sep', fearGreed: 42, sp500: 4920 },
+  { month: 'Oct', fearGreed: 26, sp500: 4780 },
+  { month: 'Nov', fearGreed: 19, sp500: 4690 },
+  { month: 'Dec', fearGreed: 22, sp500: 4750 },
 ];
 
 function sampleChartData(data, maxPoints) {
@@ -231,6 +248,7 @@ async function fetchStockNews(ticker, { signal, limit = 4 } = {}) {
     thesis: typeof json?.thesis === 'string' ? json.thesis : '',
     generatedAt: json?.generated_at || null,
     isLive: json?.is_live === true,
+    newsSource: typeof json?.news_source === 'string' ? json.news_source : 'none',
     items: items
       .filter((item) => item && typeof item.headline === 'string' && item.headline.trim())
       .map((item) => ({
@@ -243,6 +261,45 @@ async function fetchStockNews(ticker, { signal, limit = 4 } = {}) {
         link: item.link || '',
         published: item.published || null,
       })),
+  };
+}
+
+async function fetchMacroQuotes(signal) {
+  const res = await fetch(MACRO_API_URL, { signal });
+  if (!res.ok) throw new Error(`Market API returned ${res.status} ${res.statusText}`);
+  const json = await res.json();
+  const rows = Array.isArray(json) ? json : [];
+  const out = {};
+  rows.forEach((row) => {
+    const symbol = String(row?.symbol || '').toUpperCase();
+    const price = Number(row?.price);
+    const changePercent = Number(row?.change_pct);
+    if (symbol && Number.isFinite(price) && price > 0) {
+      out[symbol] = { price, changePercent: Number.isFinite(changePercent) ? changePercent : 0 };
+    }
+  });
+  return out;
+}
+
+async function fetchFearGreedIndex(signal) {
+  const res = await fetch(FEAR_GREED_API_URL, { signal });
+  if (!res.ok) throw new Error(`Fear & Greed API returned ${res.status} ${res.statusText}`);
+  const json = await res.json();
+  const history = Array.isArray(json?.history)
+    ? json.history
+        .filter((point) => point && Number.isFinite(Number(point.score)))
+        .map((point) => ({
+          month: point.label || point.date || '',
+          fearGreed: Number(point.score),
+          sp500: Number.isFinite(Number(point.sp500)) ? Number(point.sp500) : null,
+        }))
+    : [];
+  return {
+    score: Number.isFinite(Number(json?.score)) ? Number(json.score) : null,
+    rating: typeof json?.rating === 'string' ? json.rating : '',
+    source: typeof json?.source === 'string' ? json.source : 'unknown',
+    isLive: json?.is_live === true,
+    history,
   };
 }
 
@@ -259,6 +316,33 @@ function LiveIndicator({ lastSynced }) {
         <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
       </span>
       <span>Last synced: {formatSyncedTime(lastSynced)}</span>
+    </div>
+  );
+}
+
+// Live SPY/QQQ/IWM card fed by /api/market; shows a loading skeleton until the first quote arrives.
+function MacroIndexCard({ label, quote }) {
+  const hasQuote = quote && Number.isFinite(Number(quote.price));
+  const changePercent = Number(quote?.changePercent);
+  const isGain = Number.isFinite(changePercent) ? changePercent >= 0 : true;
+  return (
+    <div className={`${CARD_BASE} p-5 flex flex-col justify-center`}>
+      <h3 className="text-gray-400 text-base font-medium">{label}</h3>
+      {hasQuote ? (
+        <>
+          <p className="text-2xl md:text-3xl font-bold text-white mt-1.5 tabular-nums">
+            {Number(quote.price).toFixed(2)} USD
+          </p>
+          <p className={`text-base mt-1.5 tabular-nums ${isGain ? 'text-green-400' : 'text-red-400'}`}>
+            {isGain ? '+' : ''}{changePercent.toFixed(2)}%
+          </p>
+        </>
+      ) : (
+        <>
+          <div className="h-8 w-32 rounded bg-slate-800 animate-pulse mt-2" />
+          <div className="h-4 w-16 rounded bg-slate-800 animate-pulse mt-2.5" />
+        </>
+      )}
     </div>
   );
 }
@@ -787,6 +871,20 @@ const STOCK_AI_RATINGS = {
 
 const NEWS_SENTIMENT_POINTS = { good: 100, neutral: 65, bad: 35 };
 
+function getNewsSourceLabel(newsRecord) {
+  if (!newsRecord?.isLive || !(newsRecord?.items?.length ?? 0)) {
+    return 'AI model fallback';
+  }
+  const source = String(newsRecord?.newsSource || '').toLowerCase();
+  if (source.startsWith('yahoo_finance')) {
+    return 'Yahoo Finance + FinBERT';
+  }
+  if (source === 'rss') {
+    return 'Live RSS + FinBERT';
+  }
+  return 'Live news + FinBERT';
+}
+
 function getNewsSentimentScore(newsRecord) {
   if (Number.isFinite(Number(newsRecord?.newsSentimentScore))) {
     return Number(newsRecord.newsSentimentScore);
@@ -810,7 +908,8 @@ function buildTopAiStockPickRows(newsByTicker = {}) {
       signal,
       pickScore: (aiScore * 0.82) + (newsSentimentScore * 0.18),
       thesis: liveNews?.thesis || rating?.summary || '',
-      hasLiveNews: liveNews?.isLive === true,
+      hasLiveNews: Boolean(liveNews?.isLive && (liveNews?.items?.length ?? 0) > 0),
+      newsSourceLabel: getNewsSourceLabel(liveNews),
     };
   })
     .filter((row) => row.signal?.label === 'Strong Buy' || row.signal?.label === 'Buy')
@@ -965,7 +1064,7 @@ function MarketIntelligence({ ticker, items = [], isLoading = false, error = '' 
           <h3 className="text-xs font-semibold text-gray-300 uppercase tracking-[0.18em]">Market Intelligence</h3>
         </div>
         <span className="text-[10px] font-medium text-gray-600 uppercase tracking-wider">
-          AI Sentiment · Live RSS · {ticker}
+          AI Sentiment · Yahoo Finance · {ticker}
         </span>
       </div>
 
@@ -2412,23 +2511,25 @@ function SignalDemoPortfolioPage({ onSelectStock }) {
 function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onToggleWatchlist }) {
   const [sentimentValue, setSentimentValue] = useState(22);
   const [sentimentLastSynced, setSentimentLastSynced] = useState(null);
+  const [fearGreedHistory, setFearGreedHistory] = useState(FALLBACK_FEAR_GREED_TIMELINE);
   const [liveQuotes, setLiveQuotes] = useState({});
   const [watchlistQuotes, setWatchlistQuotes] = useState({});
   const [isSyncingTables, setIsSyncingTables] = useState(false);
   const [lastTablesSynced, setLastTablesSynced] = useState(null);
   const [newsByTicker, setNewsByTicker] = useState({});
   const [isNewsSyncing, setIsNewsSyncing] = useState(false);
+  const [macroQuotes, setMacroQuotes] = useState({});
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     const fetchFearGreed = async () => {
       try {
-        const res = await fetch(FEAR_GREED_API_URL);
-        const data = await res.json();
-        if (!res.ok || cancelled) return;
-        const liveValue = data?.value ?? data?.fearGreed ?? data?.score;
-        const parsed = Number(liveValue);
-        if (!Number.isFinite(parsed)) return;
-        setSentimentValue(Math.min(100, Math.max(0, parsed)));
+        const data = await fetchFearGreedIndex(controller.signal);
+        if (cancelled) return;
+        if (Number.isFinite(data.score)) {
+          setSentimentValue(Math.min(100, Math.max(0, data.score)));
+        }
+        if (data.history.length > 0) setFearGreedHistory(data.history);
         setSentimentLastSynced(Date.now());
       } catch {
         // Keep latest known value; graceful fallback.
@@ -2438,6 +2539,27 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
     const id = setInterval(fetchFearGreed, LIVE_POLL_MS);
     return () => {
       cancelled = true;
+      controller.abort();
+      clearInterval(id);
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const controller = new AbortController();
+    const fetchMacro = async () => {
+      try {
+        const data = await fetchMacroQuotes(controller.signal);
+        if (!cancelled && Object.keys(data).length > 0) setMacroQuotes(data);
+      } catch {
+        // Keep latest known values; graceful fallback.
+      }
+    };
+    fetchMacro();
+    const id = setInterval(fetchMacro, LIVE_POLL_MS);
+    return () => {
+      cancelled = true;
+      controller.abort();
       clearInterval(id);
     };
   }, []);
@@ -2562,20 +2684,6 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
   const demoPortfolioTotals = useMemo(() => sumDemoPortfolioTotals(demoPortfolioRows), [demoPortfolioRows]);
   const topAiStockPickRows = useMemo(() => buildTopAiStockPickRows(newsByTicker), [newsByTicker]);
 
-  const fearGreedTimelineData = [
-    { month: 'Jan', fearGreed: 31, sp500: 4720 },
-    { month: 'Feb', fearGreed: 38, sp500: 4890 },
-    { month: 'Mar', fearGreed: 29, sp500: 4810 },
-    { month: 'Apr', fearGreed: 45, sp500: 5020 },
-    { month: 'May', fearGreed: 41, sp500: 4940 },
-    { month: 'Jun', fearGreed: 56, sp500: 5110 },
-    { month: 'Jul', fearGreed: 48, sp500: 4980 },
-    { month: 'Aug', fearGreed: 35, sp500: 4860 },
-    { month: 'Sep', fearGreed: 42, sp500: 4920 },
-    { month: 'Oct', fearGreed: 26, sp500: 4780 },
-    { month: 'Nov', fearGreed: 19, sp500: 4690 },
-    { month: 'Dec', fearGreed: 22, sp500: 4750 },
-  ];
   const sentimentNews = {
     fearDrivers: [
       { id: 'f1', headline: 'Inflation data comes in hot, rate cut hopes fade', source: 'Reuters', time: '2h ago' },
@@ -2621,7 +2729,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
             <p className="text-xs text-gray-500 mb-4 uppercase tracking-wider">Fear & Greed Index vs S&amp;P 500</p>
             <div className="w-full h-[280px] flex-shrink-0">
             <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={fearGreedTimelineData} margin={{ top: 8, right: 8, left: 4, bottom: 4 }}>
+              <ComposedChart data={fearGreedHistory} margin={{ top: 8, right: 8, left: 4, bottom: 4 }}>
                 <defs>
                   <linearGradient id="fgGradTimeline" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="0%" stopColor="#eab308" stopOpacity={0.5} />
@@ -2702,21 +2810,9 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
       </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-6 w-full">
-          <div className={`${CARD_BASE} p-5 flex flex-col justify-center`}>
-            <h3 className="text-gray-400 text-base font-medium">SPY (S&amp;P 500)</h3>
-            <p className="text-2xl md:text-3xl font-bold text-white mt-1.5">593.30 USD</p>
-            <p className="text-red-400 text-base mt-1.5">-0.47%</p>
-          </div>
-          <div className={`${CARD_BASE} p-5 flex flex-col justify-center`}>
-            <h3 className="text-gray-400 text-base font-medium">QQQ (Nasdaq)</h3>
-            <p className="text-2xl md:text-3xl font-bold text-white mt-1.5">498.12 USD</p>
-            <p className="text-green-400 text-base mt-1.5">+0.12%</p>
-          </div>
-          <div className={`${CARD_BASE} p-5 flex flex-col justify-center`}>
-            <h3 className="text-gray-400 text-base font-medium">IWM (Russell 2000)</h3>
-            <p className="text-2xl md:text-3xl font-bold text-white mt-1.5">215.40 USD</p>
-            <p className="text-green-400 text-base mt-1.5">+1.05%</p>
-          </div>
+          <MacroIndexCard label="SPY (S&amp;P 500)" quote={macroQuotes.SPY} />
+          <MacroIndexCard label="QQQ (Nasdaq)" quote={macroQuotes.QQQ} />
+          <MacroIndexCard label="IWM (Russell 2000)" quote={macroQuotes.IWM} />
         </div>
 
         {/* Top AI stock picks */}
@@ -2727,7 +2823,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
               <div>
                 <h3 className="text-sm font-semibold text-white uppercase tracking-wider">Top 5 AI Stock Picks</h3>
                 <p className="text-[10px] text-gray-500 mt-0.5">
-                  Ranked by the model signal plus live RSS headlines scored by FinBERT NLP.
+                  Ranked by the model signal plus Yahoo Finance headlines scored by FinBERT NLP.
                 </p>
               </div>
             </div>
@@ -2784,7 +2880,7 @@ function HomeDashboard({ onSelectStock, watchlistTickers, onRemoveWatchlist, onT
                         <div className="flex flex-col gap-1">
                           <span>{row.thesis}</span>
                           <span className={`text-[10px] uppercase tracking-wider ${row.hasLiveNews ? 'text-emerald-400' : 'text-gray-600'}`}>
-                            {row.hasLiveNews ? 'Live RSS + FinBERT' : 'AI model fallback'}
+                            {row.newsSourceLabel}
                           </span>
                         </div>
                       </td>

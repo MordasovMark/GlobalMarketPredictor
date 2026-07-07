@@ -269,36 +269,56 @@ def _fetch_recent_prices(ticker: str) -> Dict[str, float]:
 
 
 def _fetch_yahoo_rss_news(ticker: str) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["title", "published", "summary", "link"])
     url = f"https://finance.yahoo.com/rss/headline?s={ticker}"
     try:
         parsed = feedparser.parse(url)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to parse Yahoo RSS for %s: %s", ticker, exc)
-        return pd.DataFrame(columns=["title", "published", "summary", "link"])
+        parsed = None
 
-    if getattr(parsed, "bozo", False):
-        logger.warning(
-            "Yahoo RSS malformed for %s: %s", ticker, getattr(parsed, "bozo_exception", None)
-        )
-
-    entries = getattr(parsed, "entries", []) or []
     records: list[dict[str, str]] = []
-    for e in entries:
-        records.append(
-            {
-                "title": str(getattr(e, "title", "") or ""),
-                "published": str(
-                    getattr(e, "published", "") or getattr(e, "updated", "") or ""
-                ),
-                "summary": str(
-                    getattr(e, "summary", "") or getattr(e, "description", "") or ""
-                ),
-                "link": str(getattr(e, "link", "") or ""),
-            }
-        )
+    if parsed is not None:
+        if getattr(parsed, "bozo", False):
+            logger.warning(
+                "Yahoo RSS malformed for %s: %s",
+                ticker,
+                getattr(parsed, "bozo_exception", None),
+            )
+        for e in getattr(parsed, "entries", []) or []:
+            records.append(
+                {
+                    "title": str(getattr(e, "title", "") or ""),
+                    "published": str(
+                        getattr(e, "published", "") or getattr(e, "updated", "") or ""
+                    ),
+                    "summary": str(
+                        getattr(e, "summary", "") or getattr(e, "description", "") or ""
+                    ),
+                    "link": str(getattr(e, "link", "") or ""),
+                }
+            )
+
+    if not records:
+        from api import _fetch_yfinance_news
+
+        yf_records = _fetch_yfinance_news(ticker)
+        for item in yf_records:
+            published = item.get("published_ts")
+            records.append(
+                {
+                    "title": str(item.get("headline", "") or ""),
+                    "published": published.isoformat() if published is not None else "",
+                    "summary": str(item.get("summary", "") or ""),
+                    "link": str(item.get("link", "") or ""),
+                }
+            )
+        if records:
+            logger.info("Using Yahoo Finance API fallback for %s news (%d items).", ticker, len(records))
+
     df = pd.DataFrame.from_records(records)
     if df.empty:
-        return df
+        return empty
 
     df["published"] = pd.to_datetime(df["published"], errors="coerce")
     pub = df["published"]

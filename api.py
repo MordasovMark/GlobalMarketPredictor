@@ -188,6 +188,113 @@ def _parse_news_feed(url: str, fallback_source: str) -> List[Dict[str, Any]]:
     return records
 
 
+def _news_dedupe_key(headline: str) -> str:
+    return re.sub(r"\W+", "", str(headline).lower())
+
+
+def _within_news_lookback(published: Optional[pd.Timestamp]) -> bool:
+    if published is None:
+        return True
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=NEWS_LOOKBACK_DAYS)
+    return published >= cutoff
+
+
+def _extract_yfinance_link(entry: Dict[str, Any], content: Dict[str, Any]) -> str:
+    for container in (content, entry):
+        for key in ("canonicalUrl", "clickThroughUrl"):
+            url_obj = container.get(key)
+            if isinstance(url_obj, dict):
+                url = str(url_obj.get("url") or "").strip()
+                if url:
+                    return url
+            elif isinstance(url_obj, str) and url_obj.strip():
+                return url_obj.strip()
+    return str(entry.get("link") or entry.get("url") or "").strip()
+
+
+def _parse_yfinance_news_entries(raw_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize yfinance Ticker.news payloads into the shared news record shape."""
+    records: List[Dict[str, Any]] = []
+    for entry in raw_entries or []:
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content") if isinstance(entry.get("content"), dict) else entry
+        headline = _clean_news_text(content.get("title") or entry.get("title"))
+        if not headline:
+            continue
+        summary = _clean_news_text(
+            content.get("summary")
+            or content.get("description")
+            or entry.get("summary")
+            or entry.get("description")
+            or ""
+        )
+        published_raw = (
+            content.get("pubDate")
+            or content.get("displayTime")
+            or entry.get("pubDate")
+            or entry.get("providerPublishTime")
+        )
+        published = _parse_published(published_raw)
+        if published is None and entry.get("providerPublishTime") is not None:
+            published = pd.to_datetime(entry["providerPublishTime"], unit="s", utc=True, errors="coerce")
+            if pd.isna(published):
+                published = None
+        provider = content.get("provider") if isinstance(content.get("provider"), dict) else {}
+        source = _clean_news_text(provider.get("displayName")) or "Yahoo Finance"
+        records.append(
+            {
+                "headline": headline,
+                "summary": summary,
+                "source": source,
+                "link": _extract_yfinance_link(entry, content),
+                "published_ts": published,
+                "provider": "yahoo_finance",
+            }
+        )
+    return records
+
+
+def _fetch_yfinance_news(ticker: str) -> List[Dict[str, Any]]:
+    """Fetch ticker headlines from the Yahoo Finance API via yfinance."""
+    symbol = _normalize_news_ticker(ticker)
+    symbols_to_try = [symbol]
+    if "-" in symbol:
+        symbols_to_try.append(symbol.replace("-", "."))
+
+    for sym in symbols_to_try:
+        try:
+            raw_entries = yf.Ticker(sym).news or []
+        except Exception:
+            continue
+        records = _parse_yfinance_news_entries(raw_entries)
+        if not records:
+            continue
+        return [record for record in records if _within_news_lookback(record.get("published_ts"))]
+    return []
+
+
+def _merge_news_records(
+    items: List[Dict[str, Any]],
+    seen: set[str],
+    records: List[Dict[str, Any]],
+    *,
+    require_relevance: bool,
+    source_ticker: str,
+) -> None:
+    for record in records:
+        published = record.get("published_ts")
+        if published is not None and not _within_news_lookback(published):
+            continue
+        if require_relevance and not _is_relevant_news_item(record, source_ticker):
+            continue
+        key = _news_dedupe_key(str(record.get("headline", "")))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        items.append(record)
+
+
 def _fetch_live_news(ticker: str) -> List[Dict[str, Any]]:
     source_ticker = _normalize_news_ticker(ticker)
     query = urllib.parse.quote_plus(f"{source_ticker} stock news OR {source_ticker} market analysis")
@@ -202,21 +309,28 @@ def _fetch_live_news(ticker: str) -> List[Dict[str, Any]]:
         ),
     ]
 
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=NEWS_LOOKBACK_DAYS)
     seen: set[str] = set()
     items: List[Dict[str, Any]] = []
+    # Primary: Yahoo Finance API (yfinance) — reliable when RSS feeds are blocked or empty.
+    _merge_news_records(
+        items,
+        seen,
+        _fetch_yfinance_news(source_ticker),
+        require_relevance=False,
+        source_ticker=source_ticker,
+    )
+
     for url, fallback_source in urls:
-        for record in _parse_news_feed(url, fallback_source):
-            published = record.get("published_ts")
-            if published is not None and published < cutoff:
-                continue
-            if not _is_relevant_news_item(record, source_ticker):
-                continue
-            key = re.sub(r"\W+", "", str(record["headline"]).lower())
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            items.append(record)
+        feed_records = _parse_news_feed(url, fallback_source)
+        for record in feed_records:
+            record.setdefault("provider", "rss")
+        _merge_news_records(
+            items,
+            seen,
+            feed_records,
+            require_relevance=True,
+            source_ticker=source_ticker,
+        )
 
     items.sort(
         key=lambda item: item.get("published_ts") or pd.Timestamp.min.tz_localize("UTC"),
@@ -325,11 +439,22 @@ def _build_news_response(ticker: str, limit: int) -> Dict[str, Any]:
     else:
         sentiment_score = 50.0
 
+    providers = {str(item.get("provider", "rss")) for item in raw_items[: max(limit * 2, limit)]}
+    if "yahoo_finance" in providers and len(providers) > 1:
+        news_source = "yahoo_finance+rss"
+    elif "yahoo_finance" in providers:
+        news_source = "yahoo_finance"
+    elif providers:
+        news_source = "rss"
+    else:
+        news_source = "none"
+
     response = {
         "ticker": display_ticker,
         "source_ticker": source_ticker,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "is_live": True,
+        "is_live": bool(scored_items),
+        "news_source": news_source,
         "news_sentiment_score": round(sentiment_score, 2),
         "thesis": _build_news_thesis(display_ticker, scored_items, sentiment_score),
         "items": [
@@ -462,6 +587,162 @@ def _get_macro_1d(symbols: List[str]) -> List[tuple[str, float, float]]:
 
 
 # ---------------------------------------------------------------------------
+# Fear & Greed index (live CNN feed, with a real-data proxy fallback)
+# ---------------------------------------------------------------------------
+CNN_FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+CNN_FEAR_GREED_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.cnn.com/markets/fear-and-greed",
+}
+FEAR_GREED_CACHE_TTL_SECONDS = 15 * 60
+_fear_greed_cache: Optional[tuple[float, Dict[str, Any]]] = None
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _rating_from_score(score: float) -> str:
+    if score >= 75:
+        return "Extreme Greed"
+    if score >= 55:
+        return "Greed"
+    if score >= 45:
+        return "Neutral"
+    if score >= 25:
+        return "Fear"
+    return "Extreme Fear"
+
+
+def _fetch_cnn_fear_greed_raw() -> Optional[Dict[str, Any]]:
+    """CNN's public dashboard API. Requires browser-like headers or it returns 418."""
+    try:
+        import requests
+
+        resp = requests.get(CNN_FEAR_GREED_URL, headers=CNN_FEAR_GREED_HEADERS, timeout=8)
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        if not isinstance(payload.get("fear_and_greed"), dict):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _monthly_gspc_closes(months: int = 12) -> Dict[str, float]:
+    try:
+        hist = yf.Ticker("^GSPC").history(period="14mo", interval="1d")
+    except Exception:
+        return {}
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return {}
+    monthly = hist["Close"].dropna().resample("ME").last().dropna().tail(months)
+    return {ts.strftime("%Y-%m"): float(val) for ts, val in monthly.items()}
+
+
+def _cnn_fear_greed_history(raw: Dict[str, Any], months: int = 12) -> List[Dict[str, Any]]:
+    hist_data = ((raw.get("fear_and_greed_historical") or {}).get("data")) or []
+    if not hist_data:
+        return []
+    hist_df = pd.DataFrame(hist_data)
+    if not {"x", "y"}.issubset(hist_df.columns):
+        return []
+    hist_df["date"] = pd.to_datetime(hist_df["x"], unit="ms", utc=True)
+    hist_df = hist_df.set_index("date").sort_index()
+    monthly_score = hist_df["y"].resample("ME").last().dropna().tail(months)
+    sp500_by_month = _monthly_gspc_closes(months)
+
+    history: List[Dict[str, Any]] = []
+    for ts, score in monthly_score.items():
+        month_key = ts.strftime("%Y-%m")
+        sp_val = sp500_by_month.get(month_key)
+        history.append(
+            {
+                "date": month_key,
+                "label": ts.strftime("%b"),
+                "score": round(float(score), 2),
+                "sp500": round(sp_val, 2) if sp_val is not None else None,
+            }
+        )
+    return history
+
+
+def _proxy_fear_greed(months: int = 12) -> Optional[Dict[str, Any]]:
+    """Deterministic fallback derived from real S&P 500 momentum + VIX level (used only if CNN is unreachable)."""
+    try:
+        spx_hist = yf.Ticker("^GSPC").history(period="20mo", interval="1d")
+        vix_hist = yf.Ticker("^VIX").history(period="14mo", interval="1d")
+    except Exception:
+        return None
+    if spx_hist is None or spx_hist.empty or vix_hist is None or vix_hist.empty:
+        return None
+
+    spx_close = spx_hist["Close"].dropna()
+    vix_close = vix_hist["Close"].dropna()
+    sma125 = spx_close.rolling(window=125, min_periods=20).mean()
+    monthly_idx = spx_close.resample("ME").last().dropna().tail(months).index
+
+    history: List[Dict[str, Any]] = []
+    for month_end in monthly_idx:
+        spx_val = float(spx_close.loc[:month_end].iloc[-1])
+        sma_series = sma125.loc[:month_end].dropna()
+        sma_val = float(sma_series.iloc[-1]) if not sma_series.empty else spx_val
+        vix_series = vix_close.loc[:month_end]
+        vix_val = float(vix_series.iloc[-1]) if not vix_series.empty else 18.0
+
+        momentum_score = _clamp(50.0 + ((spx_val / sma_val) - 1.0) * 500.0, 0.0, 100.0)
+        vix_score = _clamp(100.0 - ((vix_val - 10.0) / 30.0) * 100.0, 0.0, 100.0)
+        score = round((momentum_score * 0.5) + (vix_score * 0.5), 2)
+        history.append(
+            {
+                "date": month_end.strftime("%Y-%m"),
+                "label": month_end.strftime("%b"),
+                "score": score,
+                "sp500": round(spx_val, 2),
+            }
+        )
+
+    if not history:
+        return None
+    latest_score = history[-1]["score"]
+    return {
+        "score": latest_score,
+        "rating": _rating_from_score(latest_score),
+        "source": "proxy_vix_momentum",
+        "is_live": True,
+        "history": history,
+    }
+
+
+def _build_fear_greed_response() -> Dict[str, Any]:
+    raw = _fetch_cnn_fear_greed_raw()
+    if raw is not None:
+        current = raw["fear_and_greed"]
+        score = round(float(current.get("score")), 2)
+        rating = str(current.get("rating") or "").strip().title() or _rating_from_score(score)
+        history = _cnn_fear_greed_history(raw)
+        if history:
+            return {
+                "score": score,
+                "rating": rating,
+                "source": "cnn",
+                "is_live": True,
+                "history": history,
+            }
+
+    proxy = _proxy_fear_greed()
+    if proxy is not None:
+        return proxy
+
+    raise RuntimeError("Unable to compute Fear & Greed index from any data source.")
+
+
+# ---------------------------------------------------------------------------
 # Pydantic response models
 # ---------------------------------------------------------------------------
 class MacroItem(BaseModel):
@@ -504,9 +785,26 @@ class NewsResponse(BaseModel):
     source_ticker: str
     generated_at: str
     is_live: bool
+    news_source: str = "none"
     news_sentiment_score: float
     thesis: str
     items: List[NewsItem]
+
+
+class FearGreedPoint(BaseModel):
+    date: str
+    label: str
+    score: float
+    sp500: Optional[float] = None
+
+
+class FearGreedResponse(BaseModel):
+    score: float
+    rating: str
+    source: str
+    is_live: bool
+    generated_at: str
+    history: List[FearGreedPoint]
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +863,36 @@ def api_macro(symbols: str = "SPY,QQQ,IWM"):
         sym_list = ["SPY", "QQQ", "IWM"]
     data = _get_macro_1d(sym_list)
     return [MacroItem(symbol=s, price=p, change_pct=c) for s, p, c in data]
+
+
+@app.get("/api/fear-greed", response_model=FearGreedResponse)
+def api_fear_greed():
+    """Live CNN Fear & Greed Index plus a 12-month history for the sentiment gauge/timeline chart.
+
+    Falls back to a deterministic proxy derived from real S&P 500 momentum and VIX
+    levels if CNN's public feed is unreachable (e.g. blocked from this network).
+    """
+    global _fear_greed_cache
+    if _fear_greed_cache is not None:
+        cached_at, payload = _fear_greed_cache
+        if time.monotonic() - cached_at < FEAR_GREED_CACHE_TTL_SECONDS:
+            return payload
+
+    try:
+        data = _build_fear_greed_response()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Fear & Greed data unavailable: {exc}") from exc
+
+    payload = {
+        "score": data["score"],
+        "rating": data["rating"],
+        "source": data["source"],
+        "is_live": data["is_live"],
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "history": data["history"],
+    }
+    _fear_greed_cache = (time.monotonic(), payload)
+    return payload
 
 
 def _yf_history_for_time_range(ticker: str, time_range: str) -> tuple[pd.DataFrame, str, bool, str]:
