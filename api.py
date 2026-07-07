@@ -587,6 +587,162 @@ def _get_macro_1d(symbols: List[str]) -> List[tuple[str, float, float]]:
 
 
 # ---------------------------------------------------------------------------
+# Fear & Greed index (live CNN feed, with a real-data proxy fallback)
+# ---------------------------------------------------------------------------
+CNN_FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+CNN_FEAR_GREED_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.cnn.com/markets/fear-and-greed",
+}
+FEAR_GREED_CACHE_TTL_SECONDS = 15 * 60
+_fear_greed_cache: Optional[tuple[float, Dict[str, Any]]] = None
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _rating_from_score(score: float) -> str:
+    if score >= 75:
+        return "Extreme Greed"
+    if score >= 55:
+        return "Greed"
+    if score >= 45:
+        return "Neutral"
+    if score >= 25:
+        return "Fear"
+    return "Extreme Fear"
+
+
+def _fetch_cnn_fear_greed_raw() -> Optional[Dict[str, Any]]:
+    """CNN's public dashboard API. Requires browser-like headers or it returns 418."""
+    try:
+        import requests
+
+        resp = requests.get(CNN_FEAR_GREED_URL, headers=CNN_FEAR_GREED_HEADERS, timeout=8)
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        if not isinstance(payload.get("fear_and_greed"), dict):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _monthly_gspc_closes(months: int = 12) -> Dict[str, float]:
+    try:
+        hist = yf.Ticker("^GSPC").history(period="14mo", interval="1d")
+    except Exception:
+        return {}
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return {}
+    monthly = hist["Close"].dropna().resample("ME").last().dropna().tail(months)
+    return {ts.strftime("%Y-%m"): float(val) for ts, val in monthly.items()}
+
+
+def _cnn_fear_greed_history(raw: Dict[str, Any], months: int = 12) -> List[Dict[str, Any]]:
+    hist_data = ((raw.get("fear_and_greed_historical") or {}).get("data")) or []
+    if not hist_data:
+        return []
+    hist_df = pd.DataFrame(hist_data)
+    if not {"x", "y"}.issubset(hist_df.columns):
+        return []
+    hist_df["date"] = pd.to_datetime(hist_df["x"], unit="ms", utc=True)
+    hist_df = hist_df.set_index("date").sort_index()
+    monthly_score = hist_df["y"].resample("ME").last().dropna().tail(months)
+    sp500_by_month = _monthly_gspc_closes(months)
+
+    history: List[Dict[str, Any]] = []
+    for ts, score in monthly_score.items():
+        month_key = ts.strftime("%Y-%m")
+        sp_val = sp500_by_month.get(month_key)
+        history.append(
+            {
+                "date": month_key,
+                "label": ts.strftime("%b"),
+                "score": round(float(score), 2),
+                "sp500": round(sp_val, 2) if sp_val is not None else None,
+            }
+        )
+    return history
+
+
+def _proxy_fear_greed(months: int = 12) -> Optional[Dict[str, Any]]:
+    """Deterministic fallback derived from real S&P 500 momentum + VIX level (used only if CNN is unreachable)."""
+    try:
+        spx_hist = yf.Ticker("^GSPC").history(period="20mo", interval="1d")
+        vix_hist = yf.Ticker("^VIX").history(period="14mo", interval="1d")
+    except Exception:
+        return None
+    if spx_hist is None or spx_hist.empty or vix_hist is None or vix_hist.empty:
+        return None
+
+    spx_close = spx_hist["Close"].dropna()
+    vix_close = vix_hist["Close"].dropna()
+    sma125 = spx_close.rolling(window=125, min_periods=20).mean()
+    monthly_idx = spx_close.resample("ME").last().dropna().tail(months).index
+
+    history: List[Dict[str, Any]] = []
+    for month_end in monthly_idx:
+        spx_val = float(spx_close.loc[:month_end].iloc[-1])
+        sma_series = sma125.loc[:month_end].dropna()
+        sma_val = float(sma_series.iloc[-1]) if not sma_series.empty else spx_val
+        vix_series = vix_close.loc[:month_end]
+        vix_val = float(vix_series.iloc[-1]) if not vix_series.empty else 18.0
+
+        momentum_score = _clamp(50.0 + ((spx_val / sma_val) - 1.0) * 500.0, 0.0, 100.0)
+        vix_score = _clamp(100.0 - ((vix_val - 10.0) / 30.0) * 100.0, 0.0, 100.0)
+        score = round((momentum_score * 0.5) + (vix_score * 0.5), 2)
+        history.append(
+            {
+                "date": month_end.strftime("%Y-%m"),
+                "label": month_end.strftime("%b"),
+                "score": score,
+                "sp500": round(spx_val, 2),
+            }
+        )
+
+    if not history:
+        return None
+    latest_score = history[-1]["score"]
+    return {
+        "score": latest_score,
+        "rating": _rating_from_score(latest_score),
+        "source": "proxy_vix_momentum",
+        "is_live": True,
+        "history": history,
+    }
+
+
+def _build_fear_greed_response() -> Dict[str, Any]:
+    raw = _fetch_cnn_fear_greed_raw()
+    if raw is not None:
+        current = raw["fear_and_greed"]
+        score = round(float(current.get("score")), 2)
+        rating = str(current.get("rating") or "").strip().title() or _rating_from_score(score)
+        history = _cnn_fear_greed_history(raw)
+        if history:
+            return {
+                "score": score,
+                "rating": rating,
+                "source": "cnn",
+                "is_live": True,
+                "history": history,
+            }
+
+    proxy = _proxy_fear_greed()
+    if proxy is not None:
+        return proxy
+
+    raise RuntimeError("Unable to compute Fear & Greed index from any data source.")
+
+
+# ---------------------------------------------------------------------------
 # Pydantic response models
 # ---------------------------------------------------------------------------
 class MacroItem(BaseModel):
@@ -633,6 +789,22 @@ class NewsResponse(BaseModel):
     news_sentiment_score: float
     thesis: str
     items: List[NewsItem]
+
+
+class FearGreedPoint(BaseModel):
+    date: str
+    label: str
+    score: float
+    sp500: Optional[float] = None
+
+
+class FearGreedResponse(BaseModel):
+    score: float
+    rating: str
+    source: str
+    is_live: bool
+    generated_at: str
+    history: List[FearGreedPoint]
 
 
 # ---------------------------------------------------------------------------
@@ -691,6 +863,36 @@ def api_macro(symbols: str = "SPY,QQQ,IWM"):
         sym_list = ["SPY", "QQQ", "IWM"]
     data = _get_macro_1d(sym_list)
     return [MacroItem(symbol=s, price=p, change_pct=c) for s, p, c in data]
+
+
+@app.get("/api/fear-greed", response_model=FearGreedResponse)
+def api_fear_greed():
+    """Live CNN Fear & Greed Index plus a 12-month history for the sentiment gauge/timeline chart.
+
+    Falls back to a deterministic proxy derived from real S&P 500 momentum and VIX
+    levels if CNN's public feed is unreachable (e.g. blocked from this network).
+    """
+    global _fear_greed_cache
+    if _fear_greed_cache is not None:
+        cached_at, payload = _fear_greed_cache
+        if time.monotonic() - cached_at < FEAR_GREED_CACHE_TTL_SECONDS:
+            return payload
+
+    try:
+        data = _build_fear_greed_response()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Fear & Greed data unavailable: {exc}") from exc
+
+    payload = {
+        "score": data["score"],
+        "rating": data["rating"],
+        "source": data["source"],
+        "is_live": data["is_live"],
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "history": data["history"],
+    }
+    _fear_greed_cache = (time.monotonic(), payload)
+    return payload
 
 
 def _yf_history_for_time_range(ticker: str, time_range: str) -> tuple[pd.DataFrame, str, bool, str]:
