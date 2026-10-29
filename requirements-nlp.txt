@@ -1,0 +1,5 @@
+# Optional: FinBERT headline sentiment (set GMP_SENTIMENT_BACKEND=finbert).
+# Adds ~2 GB; the default lexicon backend needs none of this.
+-r requirements.txt
+transformers>=4.40
+torch>=2.2

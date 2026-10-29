@@ -1,0 +1,26 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local data / databases / logs
+*.db
+*.sqlite
+*.log
+data/
+
+# Frontend
+node_modules/
+frontend/dist/
+
+# Editor / tooling
+_bmad/
+.DS_Store

@@ -1,16 +1,15 @@
-# React + Vite
+# Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React 19 + Vite + Tailwind + Recharts. All data comes from the FastAPI backend (see the root README).
 
-Currently, two official plugins are available:
+```
+src/
+  App.jsx                 shell: nav, search, routing, watchlist
+  pages/                  HomeDashboard, StockDetailPage, SignalPortfolioPage
+  components/             charts, rating panel, gauges, tables
+  lib/api.js              the only place that calls the network
+  lib/MarketDataContext   shared quotes / ratings / universe polling
+  data/stocks.js          static names + descriptions (no prices)
+```
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+`npm run dev` · `npm run lint` · `npm run build`. Set `VITE_API_BASE_URL` to point at another API.

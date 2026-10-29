@@ -1,0 +1,33 @@
+name: Retrain model
+
+# Weekly walk-forward retrain on 10 years of Yahoo Finance data. The new model,
+# its model card (out-of-sample metrics) and out-of-sample predictions are
+# committed back, so the deployed API picks them up on the next deploy.
+on:
+  schedule:
+    - cron: "17 6 * * 6" # Saturdays 06:17 UTC, after the US week closes
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Walk-forward train + evaluate
+        run: python -m gmp.training --period 10y --min-train-days 756 --step-days 63
+      - name: Commit new artifacts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add artifacts
+          git diff --cached --quiet || git commit -m "Weekly model retrain ($(date -u +%F))"
+          git push

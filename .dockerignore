@@ -1,0 +1,7 @@
+.git
+.env
+frontend
+tests
+_bmad
+.cursor
+**/__pycache__
